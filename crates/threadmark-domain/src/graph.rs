@@ -62,7 +62,11 @@ pub struct ReadinessReport {
 }
 
 pub fn calculate_frontier(graph: &GraphSnapshot, now: &str) -> Vec<FrontierEntry> {
-    let nodes: HashMap<_, _> = graph.nodes.iter().map(|node| (node.id.as_str(), node)).collect();
+    let nodes: HashMap<_, _> = graph
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect();
     let claimed: HashSet<_> = graph
         .claims
         .iter()
@@ -85,9 +89,11 @@ pub fn calculate_frontier(graph: &GraphSnapshot, now: &str) -> Vec<FrontierEntry
                     edge.source_node_id == node.id && edge.edge_type == EdgeType::Requires
                 })
                 .all(|edge| {
-                    nodes.get(edge.target_node_id.as_str()).is_some_and(|required| {
-                        required.lifecycle == Lifecycle::Resolved && required.usable()
-                    })
+                    nodes
+                        .get(edge.target_node_id.as_str())
+                        .is_some_and(|required| {
+                            required.lifecycle == Lifecycle::Resolved && required.usable()
+                        })
                 })
         })
         .map(|node| {
@@ -128,9 +134,10 @@ fn downstream_fanout(node_id: &str, edges: &[Edge]) -> usize {
     let mut seen = HashSet::new();
     let mut queue = VecDeque::from([node_id]);
     while let Some(current) = queue.pop_front() {
-        for edge in edges.iter().filter(|edge| {
-            edge.edge_type == EdgeType::Requires && edge.target_node_id == current
-        }) {
+        for edge in edges
+            .iter()
+            .filter(|edge| edge.edge_type == EdgeType::Requires && edge.target_node_id == current)
+        {
             if seen.insert(edge.source_node_id.as_str()) {
                 queue.push_back(edge.source_node_id.as_str());
             }
@@ -144,7 +151,11 @@ pub fn preview_invalidation(
     node_id: &str,
     target_validity: Validity,
 ) -> InvalidationPreview {
-    let nodes: HashMap<_, _> = graph.nodes.iter().map(|node| (node.id.as_str(), node)).collect();
+    let nodes: HashMap<_, _> = graph
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect();
     let Some(root) = nodes.get(node_id) else {
         return InvalidationPreview::default();
     };
@@ -209,6 +220,7 @@ pub fn preview_invalidation(
     preview
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn evaluate_readiness(graph: &GraphSnapshot) -> ReadinessReport {
     let mut results = Vec::new();
     let criteria = if graph.exit_criteria.is_empty() {
@@ -236,7 +248,11 @@ pub fn evaluate_readiness(graph: &GraphSnapshot) -> ReadinessReport {
                     })
                     .map(|node| node.id.clone())
                     .collect();
-                (nodes.is_empty(), format!("{} open required nodes", nodes.len()), nodes)
+                (
+                    nodes.is_empty(),
+                    format!("{} open required nodes", nodes.len()),
+                    nodes,
+                )
             }
             "no_active_fog" => {
                 let count = graph
@@ -253,12 +269,18 @@ pub fn evaluate_readiness(graph: &GraphSnapshot) -> ReadinessReport {
                     .findings
                     .iter()
                     .filter(|finding| {
-                        matches!(finding.status, FindingStatus::Proposed | FindingStatus::Accepted)
-                            && matches!(finding.severity, RiskLevel::High | RiskLevel::Critical)
+                        matches!(
+                            finding.status,
+                            FindingStatus::Proposed | FindingStatus::Accepted
+                        ) && matches!(finding.severity, RiskLevel::High | RiskLevel::Critical)
                     })
                     .flat_map(|finding| finding.related_nodes.clone())
                     .collect();
-                (ids.is_empty(), format!("{} blocking findings", ids.len()), ids)
+                (
+                    ids.is_empty(),
+                    format!("{} blocking findings", ids.len()),
+                    ids,
+                )
             }
             "requires_confidence_for_reversibility" => {
                 let required = criterion
@@ -274,13 +296,18 @@ pub fn evaluate_readiness(graph: &GraphSnapshot) -> ReadinessReport {
                         node.kind == NodeKind::Decision
                             && node.lifecycle == Lifecycle::Resolved
                             && node.reversibility == Some(Reversibility::Expensive)
-                            && node.confidence.is_none_or(|confidence| confidence.rank() < required.rank())
+                            && node
+                                .confidence
+                                .is_none_or(|confidence| confidence.rank() < required.rank())
                     })
                     .map(|node| node.id.clone())
                     .collect();
                 (
                     ids.is_empty(),
-                    format!("{} expensive decisions below {required} confidence", ids.len()),
+                    format!(
+                        "{} expensive decisions below {required} confidence",
+                        ids.len()
+                    ),
                     ids,
                 )
             }
@@ -298,9 +325,17 @@ pub fn evaluate_readiness(graph: &GraphSnapshot) -> ReadinessReport {
                         node.usable()
                     }
                 });
-                (passed, format!("node {id} satisfies {}: {passed}", criterion.criterion_type), vec![id.into()])
+                (
+                    passed,
+                    format!("node {id} satisfies {}: {passed}", criterion.criterion_type),
+                    vec![id.into()],
+                )
             }
-            other => (false, format!("unsupported readiness criterion: {other}"), vec![]),
+            other => (
+                false,
+                format!("unsupported readiness criterion: {other}"),
+                vec![],
+            ),
         };
         results.push(RequirementResult {
             criterion_id: criterion.id,
@@ -325,7 +360,9 @@ pub fn evaluate_readiness(graph: &GraphSnapshot) -> ReadinessReport {
         related_nodes: vec![],
     });
 
-    let ready = results.iter().all(|result| !result.required || result.passed);
+    let ready = results
+        .iter()
+        .all(|result| !result.required || result.passed);
     ReadinessReport { ready, results }
 }
 
@@ -340,10 +377,7 @@ fn synthetic(criterion_type: &str) -> ExitCriterion {
     }
 }
 
-fn validity_check(
-    graph: &GraphSnapshot,
-    validity: Validity,
-) -> (bool, String, Vec<String>) {
+fn validity_check(graph: &GraphSnapshot, validity: Validity) -> (bool, String, Vec<String>) {
     let ids: Vec<_> = graph
         .nodes
         .iter()
@@ -429,9 +463,11 @@ mod tests {
         };
         let preview = preview_invalidation(&graph, "assumption", Validity::Invalid);
         assert_eq!(preview.changes.len(), 3);
-        assert!(preview.changes.iter().any(|change| {
-            change.node_id == "decision" && change.to == Validity::Undermined
-        }));
+        assert!(
+            preview.changes.iter().any(|change| {
+                change.node_id == "decision" && change.to == Validity::Undermined
+            })
+        );
         assert!(preview.changes.iter().any(|change| {
             change.node_id == "dependent" && change.to == Validity::ReviewRequired
         }));

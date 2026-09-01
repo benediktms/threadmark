@@ -243,7 +243,11 @@ impl Node {
     pub const fn usable(&self) -> bool {
         !matches!(
             self.validity,
-            Validity::Invalid | Validity::Undermined | Validity::ReviewRequired | Validity::Superseded | Validity::Stale
+            Validity::Invalid
+                | Validity::Undermined
+                | Validity::ReviewRequired
+                | Validity::Superseded
+                | Validity::Stale
         )
     }
 }

@@ -41,6 +41,12 @@ pub struct LintFinding {
     pub node_ids: Vec<String>,
 }
 
+/// Validates an edge against endpoint and graph-contract invariants.
+///
+/// # Errors
+///
+/// Returns [`DomainError::SelfEdge`] when both endpoints are the same node, or
+/// [`DomainError::InvalidEdge`] when the endpoint kinds do not support the edge type.
 pub fn validate_edge(source: &Node, edge_type: EdgeType, target: &Node) -> Result<(), DomainError> {
     if source.id == target.id {
         return Err(DomainError::SelfEdge);
@@ -68,17 +74,30 @@ pub fn validate_edge(source: &Node, edge_type: EdgeType, target: &Node) -> Resul
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn lint_graph(graph: &GraphSnapshot) -> Vec<LintFinding> {
-    let nodes: HashMap<_, _> = graph.nodes.iter().map(|node| (node.id.as_str(), node)).collect();
+    let nodes: HashMap<_, _> = graph
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect();
     let mut findings = Vec::new();
 
     for edge in &graph.edges {
         let Some(source) = nodes.get(edge.source_node_id.as_str()) else {
-            findings.push(error("TM001", format!("edge {} has a missing source", edge.id), vec![]));
+            findings.push(error(
+                "TM001",
+                format!("edge {} has a missing source", edge.id),
+                vec![],
+            ));
             continue;
         };
         let Some(target) = nodes.get(edge.target_node_id.as_str()) else {
-            findings.push(error("TM002", format!("edge {} has a missing target", edge.id), vec![]));
+            findings.push(error(
+                "TM002",
+                format!("edge {} has a missing target", edge.id),
+                vec![],
+            ));
             continue;
         };
         if let Err(issue) = validate_edge(source, edge.edge_type, target) {
@@ -101,11 +120,7 @@ pub fn lint_graph(graph: &GraphSnapshot) -> Vec<LintFinding> {
     }
 
     for node in &graph.nodes {
-        if node.confidence.is_some()
-            && node
-                .confidence_reason
-                .as_deref()
-                .is_none_or(str::is_empty)
+        if node.confidence.is_some() && node.confidence_reason.as_deref().is_none_or(str::is_empty)
         {
             findings.push(error(
                 "TM005",
@@ -126,7 +141,10 @@ pub fn lint_graph(graph: &GraphSnapshot) -> Vec<LintFinding> {
                     if selected != 1 || payload.selected_option.is_none() {
                         findings.push(error(
                             "TM006",
-                            format!("resolved decision {} must select exactly one alternative", node.title),
+                            format!(
+                                "resolved decision {} must select exactly one alternative",
+                                node.title
+                            ),
                             vec![node.id.clone()],
                         ));
                     }
@@ -141,18 +159,21 @@ pub fn lint_graph(graph: &GraphSnapshot) -> Vec<LintFinding> {
         if node.kind == NodeKind::Question
             && node.lifecycle == Lifecycle::Resolved
             && node.body.trim().is_empty()
-            && !graph.edges.iter().any(|edge| {
-                edge.edge_type == EdgeType::Resolves && edge.target_node_id == node.id
-            })
+            && !graph
+                .edges
+                .iter()
+                .any(|edge| edge.edge_type == EdgeType::Resolves && edge.target_node_id == node.id)
         {
             findings.push(error(
                 "TM008",
-                format!("resolved question {} has no answer or resolving node", node.title),
+                format!(
+                    "resolved question {} has no answer or resolving node",
+                    node.title
+                ),
                 vec![node.id.clone()],
             ));
         }
-        if node.kind == NodeKind::Evidence
-            && !graph.node_source_ids.contains_key(node.id.as_str())
+        if node.kind == NodeKind::Evidence && !graph.node_source_ids.contains_key(node.id.as_str())
         {
             findings.push(LintFinding {
                 code: "TM009".into(),
@@ -172,7 +193,10 @@ pub fn lint_graph(graph: &GraphSnapshot) -> Vec<LintFinding> {
         {
             findings.push(error(
                 "TM010",
-                format!("invalid assumption {} still has current direct dependents", node.title),
+                format!(
+                    "invalid assumption {} still has current direct dependents",
+                    node.title
+                ),
                 vec![node.id.clone()],
             ));
         }
@@ -200,6 +224,7 @@ fn error(code: &str, message: String, node_ids: Vec<String>) -> LintFinding {
     }
 }
 
+#[allow(clippy::items_after_statements)]
 fn find_cycle(nodes: &[Node], edges: &[Edge], edge_type: EdgeType) -> Option<Vec<String>> {
     let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
     for edge in edges.iter().filter(|edge| edge.edge_type == edge_type) {
@@ -218,7 +243,12 @@ fn find_cycle(nodes: &[Node], edges: &[Edge], edge_type: EdgeType) -> Option<Vec
     ) -> Option<Vec<String>> {
         if visiting.contains(node) {
             let start = path.iter().position(|entry| *entry == node).unwrap_or(0);
-            return Some(path[start..].iter().map(|entry| (*entry).to_owned()).collect());
+            return Some(
+                path[start..]
+                    .iter()
+                    .map(|entry| (*entry).to_owned())
+                    .collect(),
+            );
         }
         if visited.contains(node) {
             return None;
