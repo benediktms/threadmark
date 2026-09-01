@@ -76,6 +76,22 @@ impl Store {
         Ok(())
     }
 
+    pub async fn upsert_workspace(&self, workspace: &Workspace) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO workspaces(id,name,root_uri,schema_version,created_at,updated_at) VALUES(?,?,?,?,?,?) \
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name,root_uri=excluded.root_uri,schema_version=excluded.schema_version,updated_at=excluded.updated_at",
+        )
+        .bind(&workspace.id)
+        .bind(&workspace.name)
+        .bind(&workspace.root_uri)
+        .bind(workspace.schema_version)
+        .bind(&workspace.created_at)
+        .bind(&workspace.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn get_workspace(&self, id: &str) -> Result<Workspace, StoreError> {
         let row = sqlx::query("SELECT * FROM workspaces WHERE id = ?")
             .bind(id)

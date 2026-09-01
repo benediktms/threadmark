@@ -126,14 +126,25 @@ impl Service {
         let root = discover_root(start)?;
         let marker = fs::read_to_string(root.join(MARKER))?;
         let workspace_id = marker_value(&marker, "workspace_id")?;
+        let schema_version = marker_value(&marker, "schema_version")?
+            .parse()
+            .map_err(|_| ApplicationError::InvalidMarker("schema_version must be an integer".into()))?;
+        if schema_version > SCHEMA_VERSION {
+            return Err(ApplicationError::InvalidMarker(format!("schema version {schema_version} is newer than supported {SCHEMA_VERSION}")));
+        }
+        let timestamp = now();
+        let workspace = Workspace {
+            id: workspace_id,
+            name: marker_value(&marker, "name")?,
+            root_uri: root.to_string_lossy().into_owned(),
+            schema_version,
+            created_at: timestamp.clone(),
+            updated_at: timestamp,
+        };
         let database_path = database_path(&root);
         let store = Store::connect(&database_path).await?;
-        let workspace = store.get_workspace(&workspace_id).await?;
-        Ok(Self {
-            root,
-            workspace,
-            store,
-        })
+        store.upsert_workspace(&workspace).await?;
+        Ok(Self { root, workspace, store })
     }
 
     #[must_use]
@@ -1051,5 +1062,30 @@ mod tests {
         let status = service.status("cache").await.unwrap();
         assert_eq!(status.frontier.len(), 1);
         assert!(!status.readiness.ready);
+    }
+
+    #[tokio::test]
+    async fn opens_a_marker_without_local_database_and_marker_metadata_wins() {
+        let directory = TempDir::new().unwrap();
+        let marker_directory = directory.path().join(".threadmark");
+        std::fs::create_dir_all(&marker_directory).unwrap();
+        std::fs::write(marker_directory.join("workspace.toml"), "schema_version = 1\nworkspace_id = \"01TESTWORKSPACE000000000000\"\nname = \"committed\"\n").unwrap();
+
+        let service = Service::open(directory.path()).await.unwrap();
+        assert_eq!(service.workspace().name, "committed");
+
+        std::fs::write(marker_directory.join("workspace.toml"), "schema_version = 1\nworkspace_id = \"01TESTWORKSPACE000000000000\"\nname = \"renamed\"\n").unwrap();
+        let service = Service::open(directory.path()).await.unwrap();
+        assert_eq!(service.workspace().name, "renamed");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_newer_marker_schema() {
+        let directory = TempDir::new().unwrap();
+        let marker_directory = directory.path().join(".threadmark");
+        std::fs::create_dir_all(&marker_directory).unwrap();
+        std::fs::write(marker_directory.join("workspace.toml"), "schema_version = 2\nworkspace_id = \"01TESTWORKSPACE000000000000\"\nname = \"future\"\n").unwrap();
+
+        assert!(matches!(Service::open(directory.path()).await, Err(ApplicationError::InvalidMarker(_))));
     }
 }
