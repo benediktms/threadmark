@@ -12,6 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
+toml.workspace = true
 ulid.workspace = true
 threadmark-domain = { path = "../threadmark-domain" }
 threadmark-store = { path = "../threadmark-store" }
