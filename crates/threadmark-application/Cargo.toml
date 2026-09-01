@@ -1,0 +1,24 @@
+[package]
+name = "threadmark-application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+ulid.workspace = true
+threadmark-domain = { path = "../threadmark-domain" }
+threadmark-store = { path = "../threadmark-store" }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

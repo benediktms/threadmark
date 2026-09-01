@@ -1,0 +1,26 @@
+[package]
+name = "threadmark-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "threadmark"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+threadmark-application = { path = "../threadmark-application" }
+threadmark-domain = { path = "../threadmark-domain" }
+threadmark-export = { path = "../threadmark-export" }
+
+[lints]
+workspace = true

@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/threadmark-domain",
+  "crates/threadmark-store",
+  "crates/threadmark-application",
+  "crates/threadmark-export",
+  "crates/threadmark-cli",
+  "crates/threadmark-mcp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/benediktms/threadmark"
+rust-version = "1.85"
+
+[workspace.dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+schemars = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate"] }
+tempfile = "3.20"
+thiserror = "2.0"
+time = { version = "0.3", features = ["formatting", "macros", "serde"] }
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "io-std", "io-util", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ulid = { version = "1.2", features = ["serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
