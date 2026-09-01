@@ -1001,13 +1001,37 @@ fn database_path(root: &Path) -> PathBuf {
 }
 
 fn marker_value(marker: &str, key: &str) -> Result<String, ApplicationError> {
-    marker
+    let value = marker
         .lines()
         .find_map(|line| {
             let (candidate, value) = line.split_once('=')?;
-            (candidate.trim() == key).then(|| value.trim().trim_matches('"').to_owned())
+            (candidate.trim() == key).then(|| value.trim())
         })
-        .ok_or_else(|| ApplicationError::InvalidMarker(format!("missing {key}")))
+        .ok_or_else(|| ApplicationError::InvalidMarker(format!("missing {key}")))?;
+    let Some(value) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return Ok(value.into());
+    };
+    let mut output = String::new();
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            output.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('"') => output.push('"'),
+            Some('\\') => output.push('\\'),
+            _ => {
+                return Err(ApplicationError::InvalidMarker(format!(
+                    "invalid escape in {key}"
+                )));
+            }
+        }
+    }
+    Ok(output)
 }
 
 fn escape_toml(value: &str) -> String {
@@ -1087,5 +1111,15 @@ mod tests {
         std::fs::write(marker_directory.join("workspace.toml"), "schema_version = 2\nworkspace_id = \"01TESTWORKSPACE000000000000\"\nname = \"future\"\n").unwrap();
 
         assert!(matches!(Service::open(directory.path()).await, Err(ApplicationError::InvalidMarker(_))));
+    }
+
+    #[tokio::test]
+    async fn preserves_escaped_workspace_names() {
+        let directory = TempDir::new().unwrap();
+        let name = "quoted \"name\" with \\ slash";
+        Service::init(directory.path(), name).await.unwrap();
+
+        let service = Service::open(directory.path()).await.unwrap();
+        assert_eq!(service.workspace().name, name);
     }
 }
