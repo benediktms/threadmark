@@ -1144,4 +1144,41 @@ mod tests {
         assert_ne!(service.workspace().id, old_id);
         assert_eq!(service.list_efforts().await.unwrap().len(), 1);
     }
+
+    #[tokio::test]
+    async fn migrates_a_root_matched_workspace_when_the_marker_id_already_exists() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        service
+            .create_effort(CreateEffort {
+                slug: "effort".into(),
+                title: "Effort".into(),
+                destination: "Destination".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        let timestamp = now();
+        service
+            .store
+            .create_workspace(&Workspace {
+                id: "01TESTWORKSPACE000000000000".into(),
+                name: "test".into(),
+                root_uri: "other-worktree".into(),
+                schema_version: SCHEMA_VERSION,
+                created_at: timestamp.clone(),
+                updated_at: timestamp,
+            })
+            .await
+            .unwrap();
+        std::fs::write(
+            directory.path().join(MARKER),
+            "schema_version = 1\nworkspace_id = \"01TESTWORKSPACE000000000000\"\nname = \"test\"\n",
+        )
+        .unwrap();
+
+        let service = Service::open(directory.path()).await.unwrap();
+        assert_eq!(service.list_efforts().await.unwrap().len(), 1);
+    }
 }

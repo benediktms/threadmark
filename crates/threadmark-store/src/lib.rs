@@ -78,13 +78,18 @@ impl Store {
 
     pub async fn reconcile_workspace(&self, workspace: &Workspace) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
-        let existing = sqlx::query("SELECT * FROM workspaces WHERE id = ?")
+        let root_match = sqlx::query("SELECT * FROM workspaces WHERE root_uri = ?")
+            .bind(&workspace.root_uri)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(row_to_workspace);
+        let target = sqlx::query("SELECT * FROM workspaces WHERE id = ?")
             .bind(&workspace.id)
             .fetch_optional(&mut *tx)
-            .await?;
+            .await?
+            .map(row_to_workspace);
 
-        if let Some(row) = existing {
-            let existing = row_to_workspace(row);
+        if let Some(existing) = target {
             if existing.name != workspace.name
                 || existing.root_uri != workspace.root_uri
                 || existing.schema_version != workspace.schema_version
@@ -100,12 +105,7 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
             }
-        } else if let Some(row) = sqlx::query("SELECT * FROM workspaces WHERE root_uri = ?")
-            .bind(&workspace.root_uri)
-            .fetch_optional(&mut *tx)
-            .await?
-        {
-            let existing = row_to_workspace(row);
+        } else if let Some(existing) = root_match.as_ref() {
             let metadata_changed = existing.name != workspace.name
                 || existing.root_uri != workspace.root_uri
                 || existing.schema_version != workspace.schema_version;
@@ -120,15 +120,6 @@ impl Store {
             .bind(if metadata_changed { &workspace.updated_at } else { &existing.updated_at })
             .execute(&mut *tx)
             .await?;
-            sqlx::query("UPDATE efforts SET workspace_id = ? WHERE workspace_id = ?")
-                .bind(&workspace.id)
-                .bind(&existing.id)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("DELETE FROM workspaces WHERE id = ?")
-                .bind(&existing.id)
-                .execute(&mut *tx)
-                .await?;
         } else {
             sqlx::query(
                 "INSERT INTO workspaces(id,name,root_uri,schema_version,created_at,updated_at) VALUES(?,?,?,?,?,?)",
@@ -141,6 +132,17 @@ impl Store {
             .bind(&workspace.updated_at)
             .execute(&mut *tx)
             .await?;
+        }
+        if let Some(existing) = root_match.filter(|existing| existing.id != workspace.id) {
+            sqlx::query("UPDATE efforts SET workspace_id = ? WHERE workspace_id = ?")
+                .bind(&workspace.id)
+                .bind(&existing.id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM workspaces WHERE id = ?")
+                .bind(&existing.id)
+                .execute(&mut *tx)
+                .await?;
         }
         tx.commit().await?;
         Ok(())
