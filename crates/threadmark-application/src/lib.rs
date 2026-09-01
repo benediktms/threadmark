@@ -970,22 +970,23 @@ fn discover_root(start: &Path) -> Result<PathBuf, ApplicationError> {
 }
 
 fn database_path(root: &Path) -> PathBuf {
-    if let Ok(output) = Command::new("git")
+    let Ok(output) = Command::new("git")
         .args(["rev-parse", "--git-common-dir"])
         .current_dir(root)
         .output()
-    {
-        if output.status.success() {
-            let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-            let common = if path.is_absolute() {
-                path
-            } else {
-                root.join(path)
-            };
-            return common.join("threadmark/state.sqlite3");
-        }
+    else {
+        return root.join(".threadmark/state.sqlite3");
+    };
+    if !output.status.success() {
+        return root.join(".threadmark/state.sqlite3");
     }
-    root.join(".threadmark/state.sqlite3")
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let common = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    common.join("threadmark/state.sqlite3")
 }
 
 fn marker_value(marker: &str, key: &str) -> Result<String, ApplicationError> {
