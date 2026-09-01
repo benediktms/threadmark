@@ -152,7 +152,7 @@ impl Service {
         };
         let database_path = database_path(&root);
         let store = Store::connect(&database_path).await?;
-        store.upsert_workspace(&workspace).await?;
+        store.reconcile_workspace(&workspace).await?;
         let workspace = store.get_workspace(&marker.workspace_id).await?;
         Ok(Self {
             root,
@@ -1107,5 +1107,41 @@ mod tests {
 
         let service = Service::open(directory.path()).await.unwrap();
         assert_eq!(service.workspace().created_at, created_at);
+    }
+
+    #[tokio::test]
+    async fn preserves_workspace_updated_time_when_reopened_unchanged() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let updated_at = service.workspace().updated_at.clone();
+
+        let service = Service::open(directory.path()).await.unwrap();
+        assert_eq!(service.workspace().updated_at, updated_at);
+    }
+
+    #[tokio::test]
+    async fn migrates_efforts_when_the_marker_replaces_a_workspace_id() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let old_id = service.workspace().id.clone();
+        service
+            .create_effort(CreateEffort {
+                slug: "effort".into(),
+                title: "Effort".into(),
+                destination: "Destination".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        std::fs::write(
+            directory.path().join(MARKER),
+            "schema_version = 1\nworkspace_id = \"01TESTWORKSPACE000000000000\"\nname = \"test\"\n",
+        )
+        .unwrap();
+
+        let service = Service::open(directory.path()).await.unwrap();
+        assert_ne!(service.workspace().id, old_id);
+        assert_eq!(service.list_efforts().await.unwrap().len(), 1);
     }
 }

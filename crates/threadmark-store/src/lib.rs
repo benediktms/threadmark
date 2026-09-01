@@ -76,19 +76,73 @@ impl Store {
         Ok(())
     }
 
-    pub async fn upsert_workspace(&self, workspace: &Workspace) -> Result<(), StoreError> {
-        sqlx::query(
-            "INSERT INTO workspaces(id,name,root_uri,schema_version,created_at,updated_at) VALUES(?,?,?,?,?,?) \
-             ON CONFLICT(id) DO UPDATE SET name=excluded.name,root_uri=excluded.root_uri,schema_version=excluded.schema_version,updated_at=excluded.updated_at",
-        )
-        .bind(&workspace.id)
-        .bind(&workspace.name)
-        .bind(&workspace.root_uri)
-        .bind(workspace.schema_version)
-        .bind(&workspace.created_at)
-        .bind(&workspace.updated_at)
-        .execute(&self.pool)
-        .await?;
+    pub async fn reconcile_workspace(&self, workspace: &Workspace) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let existing = sqlx::query("SELECT * FROM workspaces WHERE id = ?")
+            .bind(&workspace.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+        if let Some(row) = existing {
+            let existing = row_to_workspace(row);
+            if existing.name != workspace.name
+                || existing.root_uri != workspace.root_uri
+                || existing.schema_version != workspace.schema_version
+            {
+                sqlx::query(
+                    "UPDATE workspaces SET name=?,root_uri=?,schema_version=?,updated_at=? WHERE id=?",
+                )
+                .bind(&workspace.name)
+                .bind(&workspace.root_uri)
+                .bind(workspace.schema_version)
+                .bind(&workspace.updated_at)
+                .bind(&workspace.id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        } else if let Some(row) = sqlx::query("SELECT * FROM workspaces WHERE root_uri = ?")
+            .bind(&workspace.root_uri)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            let existing = row_to_workspace(row);
+            let metadata_changed = existing.name != workspace.name
+                || existing.root_uri != workspace.root_uri
+                || existing.schema_version != workspace.schema_version;
+            sqlx::query(
+                "INSERT INTO workspaces(id,name,root_uri,schema_version,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            )
+            .bind(&workspace.id)
+            .bind(&workspace.name)
+            .bind(&workspace.root_uri)
+            .bind(workspace.schema_version)
+            .bind(&existing.created_at)
+            .bind(if metadata_changed { &workspace.updated_at } else { &existing.updated_at })
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("UPDATE efforts SET workspace_id = ? WHERE workspace_id = ?")
+                .bind(&workspace.id)
+                .bind(&existing.id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM workspaces WHERE id = ?")
+                .bind(&existing.id)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            sqlx::query(
+                "INSERT INTO workspaces(id,name,root_uri,schema_version,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            )
+            .bind(&workspace.id)
+            .bind(&workspace.name)
+            .bind(&workspace.root_uri)
+            .bind(workspace.schema_version)
+            .bind(&workspace.created_at)
+            .bind(&workspace.updated_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -98,14 +152,7 @@ impl Store {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(StoreError::NotFound)?;
-        Ok(Workspace {
-            id: row.get("id"),
-            name: row.get("name"),
-            root_uri: row.get("root_uri"),
-            schema_version: row.get("schema_version"),
-            created_at: row.get("created_at"),
-            updated_at: row.get("updated_at"),
-        })
+        Ok(row_to_workspace(row))
     }
 
     pub async fn create_effort(
@@ -646,6 +693,17 @@ async fn insert_event(
         .bind(event.after.as_ref().map(|value| serde_json::to_string(value).expect("JSON value serializes")))
         .bind(&event.reason).bind(&event.occurred_at).execute(&mut **tx).await?;
     Ok(())
+}
+
+fn row_to_workspace(row: SqliteRow) -> Workspace {
+    Workspace {
+        id: row.get("id"),
+        name: row.get("name"),
+        root_uri: row.get("root_uri"),
+        schema_version: row.get("schema_version"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
 }
 
 fn row_to_effort(row: SqliteRow) -> Result<Effort, StoreError> {
