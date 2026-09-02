@@ -1086,7 +1086,10 @@ mod tests {
         std::fs::create_dir_all(&marker_directory).unwrap();
         std::fs::write(marker_directory.join("workspace.toml"), "schema_version = 2\nworkspace_id = \"01TESTWORKSPACE000000000000\"\nname = \"future\"\n").unwrap();
 
-        assert!(matches!(Service::open(directory.path()).await, Err(ApplicationError::InvalidMarker(_))));
+        assert!(matches!(
+            Service::open(directory.path()).await,
+            Err(ApplicationError::InvalidMarker(_))
+        ));
     }
 
     #[tokio::test]
