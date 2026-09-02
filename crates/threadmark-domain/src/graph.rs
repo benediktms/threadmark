@@ -472,15 +472,19 @@ mod tests {
                 node("assumption", NodeKind::Assumption, Lifecycle::Resolved),
                 node("decision", NodeKind::Decision, Lifecycle::Resolved),
                 node("dependent", NodeKind::Decision, Lifecycle::Resolved),
+                node("downstream", NodeKind::Decision, Lifecycle::Resolved),
+                node("informed", NodeKind::Decision, Lifecycle::Resolved),
             ],
             edges: vec![
                 edge("decision", EdgeType::Assumes, "assumption"),
                 edge("dependent", EdgeType::Requires, "decision"),
+                edge("downstream", EdgeType::Requires, "dependent"),
+                edge("informed", EdgeType::Informs, "assumption"),
             ],
             ..GraphSnapshot::default()
         };
         let preview = preview_invalidation(&graph, "assumption", Validity::Invalid);
-        assert_eq!(preview.changes.len(), 3);
+        assert_eq!(preview.changes.len(), 4);
         assert!(
             preview.changes.iter().any(|change| {
                 change.node_id == "decision" && change.to == Validity::Undermined
@@ -489,6 +493,35 @@ mod tests {
         assert!(preview.changes.iter().any(|change| {
             change.node_id == "dependent" && change.to == Validity::ReviewRequired
         }));
+        assert!(preview.changes.iter().any(|change| {
+            change.node_id == "downstream" && change.to == Validity::ReviewRequired
+        }));
+        assert!(
+            !preview
+                .changes
+                .iter()
+                .any(|change| change.node_id == "informed")
+        );
+    }
+
+    #[test]
+    fn keeps_question_resolved_while_a_usable_resolver_remains() {
+        let graph = GraphSnapshot {
+            nodes: vec![
+                node("invalidated", NodeKind::Evidence, Lifecycle::Resolved),
+                node("usable", NodeKind::Evidence, Lifecycle::Resolved),
+                node("question", NodeKind::Question, Lifecycle::Resolved),
+            ],
+            edges: vec![
+                edge("invalidated", EdgeType::Resolves, "question"),
+                edge("usable", EdgeType::Resolves, "question"),
+            ],
+            ..GraphSnapshot::default()
+        };
+
+        let preview = preview_invalidation(&graph, "invalidated", Validity::Invalid);
+
+        assert!(preview.reopened_questions.is_empty());
     }
 
     #[test]

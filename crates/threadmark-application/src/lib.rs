@@ -1799,6 +1799,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_claims_have_exactly_one_winner() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = service
+            .create_effort(CreateEffort {
+                slug: "claim-race".into(),
+                title: "Claim race".into(),
+                destination: "Test claim exclusivity".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        let node = add_test_node(&service, &effort.slug, NodeKind::Action, "contended").await;
+
+        let (first, second) = tokio::join!(
+            service.claim_node(&effort.slug, &node.id, "first", 30),
+            service.claim_node(&effort.slug, &node.id, "second", 30),
+        );
+
+        assert_eq!(
+            [first.is_ok(), second.is_ok()]
+                .into_iter()
+                .filter(|won| *won)
+                .count(),
+            1
+        );
+        assert_eq!(
+            service.snapshot(&effort.slug).await.unwrap().1.claims.len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn non_claimable_nodes_resolve_without_a_claim() {
         let directory = TempDir::new().unwrap();
         let service = Service::init(directory.path(), "test").await.unwrap();
@@ -1933,6 +1967,10 @@ mod tests {
         }
 
         let current = service.snapshot(&effort.slug).await.unwrap().0;
+        let preview = service
+            .invalidation_preview(&effort.slug, &assumption.id, Validity::Invalid)
+            .await
+            .unwrap();
         assert!(matches!(
             service
                 .commit_invalidation(
@@ -1955,7 +1993,7 @@ mod tests {
             2
         );
 
-        let (_, version) = service
+        let (committed, version) = service
             .commit_invalidation(
                 &effort.slug,
                 &assumption.id,
@@ -1966,6 +2004,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(committed, preview);
         assert_eq!(version, current.version + 1);
         assert_eq!(
             service
