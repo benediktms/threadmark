@@ -226,18 +226,22 @@ impl Store {
         let result = sqlx::query(
             "UPDATE efforts SET status='completed' WHERE id=? AND status='active' \
              AND NOT EXISTS (SELECT 1 FROM claims JOIN nodes ON nodes.id=claims.node_id \
-                             WHERE nodes.effort_id=? AND claims.released_at IS NULL)",
+                             WHERE nodes.effort_id=? AND claims.released_at IS NULL \
+                             AND claims.lease_expires_at>?)",
         )
         .bind(&effort.id)
         .bind(&effort.id)
+        .bind(&effort.updated_at)
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
             let active_claims: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM claims JOIN nodes ON nodes.id=claims.node_id \
-                 WHERE nodes.effort_id=? AND claims.released_at IS NULL",
+                 WHERE nodes.effort_id=? AND claims.released_at IS NULL \
+                 AND claims.lease_expires_at>?",
             )
             .bind(&effort.id)
+            .bind(&effort.updated_at)
             .fetch_one(&mut *tx)
             .await?;
             return Err(if active_claims > 0 {
