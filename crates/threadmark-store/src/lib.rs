@@ -77,6 +77,7 @@ impl Store {
             .connect_with(options)
             .await?;
         sqlx::migrate!().run(&pool).await?;
+        normalize_event_timestamps(&pool).await?;
         Ok(Self { pool })
     }
 
@@ -416,13 +417,9 @@ impl Store {
         Ok(version)
     }
 
-    pub async fn insert_claim(
-        &self,
-        claim: &Claim,
-        now: &str,
-        event: &AuditEvent,
-    ) -> Result<(), StoreError> {
+    pub async fn insert_claim(&self, claim: &Claim, event: &AuditEvent) -> Result<(), StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let cutoff = reap_expired_claims_for_node(&mut tx, &claim.node_id).await?;
         let active = sqlx::query(
             "SELECT 1 FROM efforts JOIN nodes ON nodes.effort_id=efforts.id \
              WHERE nodes.id=? AND efforts.status='active'",
@@ -433,8 +430,6 @@ impl Store {
         if active.is_none() {
             return Err(StoreError::EffortInactive);
         }
-        sqlx::query("UPDATE claims SET released_at=?,release_reason='lease expired' WHERE node_id=? AND released_at IS NULL AND lease_expires_at<=?")
-            .bind(now).bind(&claim.node_id).bind(now).execute(&mut *tx).await?;
         let result = sqlx::query("INSERT INTO claims(id,node_id,actor_id,claimant,claimed_at,heartbeat_at,lease_expires_at) VALUES(?,?,?,?,?,?,?)")
             .bind(&claim.id).bind(&claim.node_id).bind(&claim.actor_id).bind(&claim.claimant)
             .bind(&claim.claimed_at).bind(&claim.heartbeat_at).bind(&claim.lease_expires_at)
@@ -451,7 +446,7 @@ impl Store {
         sqlx::query(
             "UPDATE nodes SET lifecycle='in_progress',updated_at=? WHERE id=? AND lifecycle='open'",
         )
-        .bind(now)
+        .bind(&cutoff)
         .bind(&claim.node_id)
         .execute(&mut *tx)
         .await?;
@@ -991,6 +986,17 @@ async fn reap_expired_claims(
     Ok(timestamp)
 }
 
+async fn reap_expired_claims_for_node(
+    tx: &mut Transaction<'_, Sqlite>,
+    node_id: &str,
+) -> Result<String, StoreError> {
+    let effort_id: String = sqlx::query_scalar("SELECT effort_id FROM nodes WHERE id=?")
+        .bind(node_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    reap_expired_claims(tx, &effort_id).await
+}
+
 async fn check_version(
     tx: &mut Transaction<'_, Sqlite>,
     effort_id: &str,
@@ -1045,12 +1051,13 @@ async fn insert_event(
     tx: &mut Transaction<'_, Sqlite>,
     event: &AuditEvent,
 ) -> Result<(), StoreError> {
+    let occurred_at = normalize_timestamp(&event.occurred_at)?;
     sqlx::query("INSERT INTO events(id,effort_id,actor_id,session_id,event_type,entity_type,entity_id,before_json,after_json,reason,occurred_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&event.id).bind(&event.effort_id).bind(&event.actor_id).bind(&event.session_id)
         .bind(&event.event_type).bind(&event.entity_type).bind(&event.entity_id)
         .bind(event.before.as_ref().map(|value| serde_json::to_string(value).expect("JSON value serializes")))
         .bind(event.after.as_ref().map(|value| serde_json::to_string(value).expect("JSON value serializes")))
-        .bind(&event.reason).bind(&event.occurred_at).execute(&mut **tx).await?;
+        .bind(&event.reason).bind(occurred_at).execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -1235,6 +1242,32 @@ fn parse_timestamp(value: &str) -> Result<OffsetDateTime, StoreError> {
     OffsetDateTime::parse(value, &Rfc3339).map_err(|_| StoreError::InvalidTimestamp(value.into()))
 }
 
+fn normalize_timestamp(value: &str) -> Result<String, StoreError> {
+    parse_timestamp(value)?
+        .to_offset(UtcOffset::UTC)
+        .format(&Rfc3339)
+        .map_err(|_| StoreError::InvalidTimestamp(value.into()))
+}
+
+async fn normalize_event_timestamps(pool: &SqlitePool) -> Result<(), StoreError> {
+    let rows = sqlx::query("SELECT id,occurred_at FROM events")
+        .fetch_all(pool)
+        .await?;
+    for row in rows {
+        let id: String = row.get("id");
+        let occurred_at: String = row.get("occurred_at");
+        let normalized = normalize_timestamp(&occurred_at)?;
+        if normalized != occurred_at {
+            sqlx::query("UPDATE events SET occurred_at=? WHERE id=?")
+                .bind(normalized)
+                .bind(id)
+                .execute(pool)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 fn time_candidate(value: OffsetDateTime, seconds: i64) -> Option<String> {
     let value = value
         .to_offset(UtcOffset::UTC)
@@ -1346,7 +1379,7 @@ mod tests {
             before: None,
             after: None,
             reason: None,
-            occurred_at: "later".into(),
+            occurred_at: "2026-01-01T00:00:00Z".into(),
         };
 
         store

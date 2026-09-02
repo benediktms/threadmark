@@ -521,7 +521,7 @@ impl Service {
             None,
             &timestamp,
         );
-        self.store.insert_claim(&claim, &timestamp, &audit).await?;
+        self.store.insert_claim(&claim, &audit).await?;
         Ok(claim)
     }
 
@@ -1327,11 +1327,7 @@ mod tests {
             None,
             &timestamp,
         );
-        service
-            .store
-            .insert_claim(&claim, &timestamp, &audit)
-            .await
-            .unwrap();
+        service.store.insert_claim(&claim, &audit).await.unwrap();
     }
 
     #[tokio::test]
