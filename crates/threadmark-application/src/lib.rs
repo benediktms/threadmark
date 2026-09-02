@@ -1226,6 +1226,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_completion_with_an_active_claim() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = service
+            .create_effort(CreateEffort {
+                slug: "claimed".into(),
+                title: "Claimed".into(),
+                destination: "Finish".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        let (node, _) = service
+            .add_node(AddNode {
+                effort: effort.slug.clone(),
+                node: NewNode {
+                    kind: NodeKind::Question,
+                    title: "Claimed question".into(),
+                    summary: String::new(),
+                    body: String::new(),
+                    payload: json!({}),
+                    lifecycle: Lifecycle::Open,
+                    confidence: None,
+                    confidence_reason: None,
+                    reversibility: None,
+                    impact: None,
+                    uncertainty: None,
+                    cost_of_wrong: None,
+                },
+                actor_id: "test".into(),
+                session_id: None,
+                expected_version: None,
+            })
+            .await
+            .unwrap();
+        service
+            .add_exit_criterion(
+                &effort.slug,
+                "no_active_fog".into(),
+                json!({}),
+                true,
+                "test",
+                None,
+            )
+            .await
+            .unwrap();
+        service
+            .claim_node(&effort.slug, &node.id, "test", "test", 30)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            service.complete_effort(&effort.slug, "test", None).await,
+            Err(ApplicationError::Store(StoreError::ActiveClaims))
+        ));
+    }
+
+    #[tokio::test]
     async fn opens_a_marker_without_local_database_and_marker_metadata_wins() {
         let directory = TempDir::new().unwrap();
         let marker_directory = directory.path().join(".threadmark");

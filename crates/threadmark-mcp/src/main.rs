@@ -4,7 +4,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{Value, json};
 use threadmark_application::{AddEdge, AddNode, Service};
-use threadmark_domain::{Confidence, EdgeType, Lifecycle, NewEdge, NewNode, NodeKind, Validity};
+use threadmark_domain::{
+    Confidence, EdgeType, Lifecycle, NewEdge, NewNode, NodeKind, SourceKind, SourceTrust, Validity,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing_subscriber::EnvFilter;
 
@@ -160,6 +162,36 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                 )
                 .await?;
             Ok(json!({"released": true}))
+        }
+        "threadmark_add_source" => {
+            let (source, version) = service
+                .add_source(
+                    required(args, "effort")?,
+                    SourceKind::from_str(required(args, "kind")?).map_err(anyhow::Error::msg)?,
+                    required(args, "title")?.into(),
+                    args.get("uri").and_then(Value::as_str).map(str::to_owned),
+                    args.get("excerpt")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    parse_optional(args, "trust")?.unwrap_or(SourceTrust::Unreviewed),
+                    required(args, "actor_id")?,
+                    args.get("expected_version").and_then(Value::as_i64),
+                )
+                .await?;
+            Ok(json!({"source":source,"effort_version":version}))
+        }
+        "threadmark_attach_source" => {
+            let version = service
+                .attach_source(
+                    required(args, "effort")?,
+                    required(args, "node")?,
+                    required(args, "source")?,
+                    required(args, "relationship")?,
+                    required(args, "actor_id")?,
+                    args.get("expected_version").and_then(Value::as_i64),
+                )
+                .await?;
+            Ok(json!({"effort_version":version}))
         }
         "threadmark_add_node" => {
             let effort = required(args, "effort")?;
@@ -347,6 +379,22 @@ fn tool_definitions() -> Vec<Value> {
             object(
                 &["effort", "claim_id", "actor_id"],
                 json!({"effort":{"type":"string"},"claim_id":{"type":"string"},"actor_id":{"type":"string"},"reason":{"type":"string"}}),
+            ),
+        ),
+        tool(
+            "threadmark_add_source",
+            "Record structured provenance for an effort",
+            object(
+                &["effort", "kind", "title", "actor_id"],
+                json!({"effort":{"type":"string"},"kind":{"type":"string"},"title":{"type":"string"},"uri":{"type":"string"},"excerpt":{"type":"string"},"trust":{"type":"string"},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
+            ),
+        ),
+        tool(
+            "threadmark_attach_source",
+            "Attach recorded provenance to a node",
+            object(
+                &["effort", "node", "source", "relationship", "actor_id"],
+                json!({"effort":{"type":"string"},"node":{"type":"string"},"source":{"type":"string"},"relationship":{"type":"string"},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
             ),
         ),
         tool(
