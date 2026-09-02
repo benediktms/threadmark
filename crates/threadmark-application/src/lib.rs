@@ -42,6 +42,10 @@ pub enum ApplicationError {
     NotOnFrontier(String),
     #[error("graph mutation would violate invariants: {0}")]
     InvalidGraph(String),
+    #[error("effort is not ready: {0}")]
+    EffortNotReady(String),
+    #[error("effort is not active: {0}")]
+    EffortNotActive(EffortStatus),
     #[error("expected version {expected}, but effort is at version {actual}")]
     VersionConflict { expected: i64, actual: i64 },
 }
@@ -207,6 +211,53 @@ impl Service {
 
     pub async fn get_effort(&self, selector: &str) -> Result<Effort, ApplicationError> {
         Ok(self.store.get_effort(&self.workspace.id, selector).await?)
+    }
+
+    pub async fn complete_effort(
+        &self,
+        selector: &str,
+        actor_id: &str,
+        expected_version: Option<i64>,
+    ) -> Result<Effort, ApplicationError> {
+        let status = self.status(selector).await?;
+        if status.effort.status != EffortStatus::Active {
+            return Err(ApplicationError::EffortNotActive(status.effort.status));
+        }
+        if !status.readiness.ready {
+            return Err(ApplicationError::EffortNotReady(
+                status
+                    .readiness
+                    .results
+                    .into_iter()
+                    .filter(|result| !result.passed)
+                    .map(|result| result.explanation)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+        let expected = expected_version.unwrap_or(status.effort.version);
+        let timestamp = now();
+        let mut effort = status.effort.clone();
+        effort.status = EffortStatus::Completed;
+        effort.version += 1;
+        effort.updated_at = timestamp.clone();
+        let event = event(
+            Some(&effort.id),
+            actor_id,
+            None,
+            "effort_completed",
+            "effort",
+            &effort.id,
+            Some(serde_json::to_value(&status.effort)?),
+            Some(serde_json::to_value(&effort)?),
+            None,
+            &timestamp,
+        );
+        effort.version = self
+            .store
+            .complete_effort(&effort, &event, expected)
+            .await?;
+        Ok(effort)
     }
 
     pub async fn add_node(&self, input: AddNode) -> Result<(Node, i64), ApplicationError> {
@@ -1062,6 +1113,81 @@ mod tests {
         let status = service.status("cache").await.unwrap();
         assert_eq!(status.frontier.len(), 1);
         assert!(!status.readiness.ready);
+    }
+
+    #[tokio::test]
+    async fn completes_a_ready_effort_and_records_an_event() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = service
+            .create_effort(CreateEffort {
+                slug: "complete".into(),
+                title: "Complete".into(),
+                destination: "Finish".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+
+        let completed = service
+            .complete_effort(&effort.slug, "test", Some(effort.version))
+            .await
+            .unwrap();
+        assert_eq!(completed.status, EffortStatus::Completed);
+        assert_eq!(completed.version, effort.version + 1);
+        assert!(
+            service
+                .effort_history(&effort.slug)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| event.event_type == "effort_completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_completion_when_readiness_fails() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = service
+            .create_effort(CreateEffort {
+                slug: "not-ready".into(),
+                title: "Not ready".into(),
+                destination: "Finish".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        service
+            .add_node(AddNode {
+                effort: effort.slug.clone(),
+                node: NewNode {
+                    kind: NodeKind::Question,
+                    title: "Unresolved".into(),
+                    summary: String::new(),
+                    body: String::new(),
+                    payload: json!({}),
+                    lifecycle: Lifecycle::Open,
+                    confidence: None,
+                    confidence_reason: None,
+                    reversibility: None,
+                    impact: Some(RiskLevel::High),
+                    uncertainty: Some(Uncertainty::High),
+                    cost_of_wrong: Some(RiskLevel::High),
+                },
+                actor_id: "test".into(),
+                session_id: None,
+                expected_version: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            service.complete_effort(&effort.slug, "test", None).await,
+            Err(ApplicationError::EffortNotReady(_))
+        ));
     }
 
     #[tokio::test]

@@ -211,6 +211,24 @@ impl Store {
         Ok(())
     }
 
+    pub async fn complete_effort(
+        &self,
+        effort: &Effort,
+        event: &AuditEvent,
+        expected_version: i64,
+    ) -> Result<i64, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        check_version(&mut tx, &effort.id, expected_version).await?;
+        sqlx::query("UPDATE efforts SET status='completed' WHERE id=?")
+            .bind(&effort.id)
+            .execute(&mut *tx)
+            .await?;
+        insert_event(&mut tx, event).await?;
+        let version = bump_version(&mut tx, &effort.id, &effort.updated_at).await?;
+        tx.commit().await?;
+        Ok(version)
+    }
+
     pub async fn list_efforts(&self, workspace_id: &str) -> Result<Vec<Effort>, StoreError> {
         let rows = sqlx::query("SELECT * FROM efforts WHERE workspace_id = ? ORDER BY created_at")
             .bind(workspace_id)

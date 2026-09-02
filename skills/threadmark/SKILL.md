@@ -6,8 +6,13 @@ description: Use a Threadmark reasoning graph to chart uncertain work, resolve i
 # Threadmark
 
 Threadmark is the durable source of truth for what an effort knows, assumes,
-has decided, and still needs to resolve. Use its CLI or MCP tools; never edit its
-SQLite database directly.
+has decided, and still needs to resolve. Agents use its MCP tools whenever they
+are available. If the MCP is not exposed in the current session, stop and ask
+for a restart; do not fall back to the CLI or edit SQLite directly.
+
+Effort creation is deliberately an operator/bootstrap concern, not an agent
+workflow tool. Work only on an existing effort. An effort is complete only
+after readiness passes and `threadmark_complete_effort` succeeds.
 
 ## Orient first
 
@@ -27,7 +32,8 @@ Choose the mode that matches the request:
   descendant. Treat contradiction detection as a proposal until adjudicated.
   Preview invalidation before committing it.
 - **Handoff:** require readiness to pass, then generate and review the handoff.
-  Stop at the specification boundary unless execution is explicitly in scope.
+  Complete the effort through MCP. Stop at the specification boundary unless
+  execution is explicitly in scope.
 
 ## Invariants
 

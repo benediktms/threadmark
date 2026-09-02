@@ -93,6 +93,15 @@ async fn handle(service: &Service, request: &Value) -> Value {
 async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value> {
     match name {
         "threadmark_list_efforts" => Ok(serde_json::to_value(service.list_efforts().await?)?),
+        "threadmark_complete_effort" => Ok(serde_json::to_value(
+            service
+                .complete_effort(
+                    required(args, "effort")?,
+                    required(args, "actor_id")?,
+                    args.get("expected_version").and_then(Value::as_i64),
+                )
+                .await?,
+        )?),
         "threadmark_get_context" => {
             let effort = required(args, "effort")?;
             Ok(serde_json::to_value(service.status(effort).await?)?)
@@ -285,6 +294,14 @@ fn tool_definitions() -> Vec<Value> {
             "threadmark_list_efforts",
             "List reasoning efforts",
             json!({"type":"object","properties":{}}),
+        ),
+        tool(
+            "threadmark_complete_effort",
+            "Complete a readiness-passing effort",
+            object(
+                &["effort", "actor_id"],
+                json!({"effort":{"type":"string"},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
+            ),
         ),
         tool(
             "threadmark_get_context",
