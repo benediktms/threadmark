@@ -375,7 +375,9 @@ impl Service {
     }
 
     pub async fn status(&self, effort: &str) -> Result<EffortStatusView, ApplicationError> {
-        let (effort, graph) = self.snapshot(effort).await?;
+        let effort = self.get_effort(effort).await?;
+        self.store.reap_expired_claims(&effort.id, &now()).await?;
+        let graph = self.store.snapshot(&effort.id).await?;
         let frontier = calculate_frontier(&graph, &now());
         let readiness = evaluate_readiness(&graph);
         let lint = lint_graph(&graph);
