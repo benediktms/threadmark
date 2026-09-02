@@ -20,6 +20,14 @@ Always begin in **Orient**. Load low-resolution context and read the
 destination, scope, readiness failures, frontier, active findings, and active
 fog. Fetch a full node only when it is relevant to the next transition.
 
+When the frontier is non-empty, surface its highest-ranked node as a concise
+**next decision** before proposing work: name the question, state the decision
+or fact it must settle, and say why it matters now. If it needs the user's
+judgment, ask one direct question and stop. If repository or source research
+can answer it, say so and ask for explicit approval to enter **Work**. Do not
+silently choose, claim, or resolve the next node. Do not re-ask a question
+already answered in the graph.
+
 ```text
 Orient
   -> Plan       when the user asks to chart, scope, or discuss an effort
@@ -37,6 +45,12 @@ decisions breadth-first; connect dependencies with typed edges. Do not invent
 answers or resolve a decision simply because it was mapped. End in **Stop** and
 ask for approval before entering **Work**.
 
+Use the frontier to guide the conversation as Wayfinder-style decision prompts:
+ask one question at a time, wait for the answer, then record only the resulting
+fact or decision. After charting, summarize the remaining named questions in
+priority order and stop; the user chooses whether to answer one or authorize
+research.
+
 When the boundary of an unknown cannot yet be stated as a useful question,
 record it as a fog patch, with its decision anchor when one is known. Fog is a
 deliberate promise to return, not an unstructured note. A bounded unknown is a
@@ -49,6 +63,12 @@ Gather evidence, record provenance, add any newly exposed questions, then
 resolve only that node with the conclusion, alternatives rejected, confidence,
 and confidence reason. Finish with **Verify**. Independent research nodes may
 be worked in parallel.
+
+After resolving one substantive node, do not silently continue or spawn workers.
+If an independent actionable frontier remains, offer to delegate exactly one
+node. On explicit approval, the worker must claim that node before investigation,
+resolve only it, and return its evidence for the lead agent to verify. If no
+worker capability is available, stop and ask for a fresh session instead.
 
 If work uncovers an unknown, classify it before continuing:
 
