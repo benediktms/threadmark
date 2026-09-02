@@ -71,9 +71,9 @@ resolve only it, and return its evidence for the lead agent to verify. If no
 worker capability is available, stop and ask for a fresh session instead.
 
 After every delegated result, the lead agent must verify the resolved node,
-frontier, lint, and readiness through MCP before reporting success or offering
-another delegation. A failed verification enters **Reconcile**; do not trust a
-worker summary alone.
+frontier, lint, and readiness through MCP, then inspect the worker's relevant
+code evidence or diff. A failed verification enters **Reconcile**; do not trust
+a worker summary alone.
 
 If work uncovers an unknown, classify it before continuing:
 
