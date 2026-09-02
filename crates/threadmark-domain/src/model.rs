@@ -349,6 +349,8 @@ pub struct AuditEvent {
     pub id: Id,
     pub effort_id: Option<Id>,
     pub actor_id: String,
+    #[schemars(skip)]
+    #[serde(skip_deserializing, skip_serializing)]
     pub session_id: Option<String>,
     pub event_type: String,
     pub entity_type: String,
@@ -357,6 +359,17 @@ pub struct AuditEvent {
     pub after: Option<Value>,
     pub reason: Option<String>,
     pub occurred_at: String,
+}
+
+#[derive(Clone, Debug, Default, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct EventFilter {
+    pub effort_id: Option<Id>,
+    pub entity_type: Option<String>,
+    pub entity_id: Option<Id>,
+    pub actor_id: Option<String>,
+    pub event_type: Option<String>,
+    pub occurred_from: Option<String>,
+    pub occurred_to: Option<String>,
 }
 
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]

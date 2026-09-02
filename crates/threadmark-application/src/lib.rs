@@ -12,10 +12,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use threadmark_domain::{
-    AuditEvent, Claim, Confidence, DomainError, Edge, Effort, EffortStatus, ExitCriterion, Finding,
-    FindingStatus, FindingType, FogPatch, FogStatus, FrontierEntry, GraphSnapshot,
-    InvalidationPreview, Lifecycle, LintFinding, NewEdge, NewNode, Node, NodeRevision,
-    ReadinessReport, RiskLevel, Source, SourceKind, SourceTrust, Validity, Workspace,
+    AuditEvent, Claim, Confidence, DomainError, Edge, Effort, EffortStatus, EventFilter,
+    ExitCriterion, Finding, FindingStatus, FindingType, FogPatch, FogStatus, FrontierEntry,
+    GraphSnapshot, InvalidationPreview, Lifecycle, LintFinding, NewEdge, NewNode, Node,
+    NodeRevision, ReadinessReport, RiskLevel, Source, SourceKind, SourceTrust, Validity, Workspace,
     calculate_frontier, evaluate_readiness, lint_graph, preview_invalidation, validate_edge,
 };
 use threadmark_store::{ClaimGuard, Store, StoreError};
@@ -422,8 +422,21 @@ impl Service {
     }
 
     pub async fn effort_history(&self, effort: &str) -> Result<Vec<AuditEvent>, ApplicationError> {
-        let effort = self.get_effort(effort).await?;
-        Ok(self.store.list_events(&effort.id).await?)
+        self.history(EventFilter {
+            effort_id: Some(effort.into()),
+            ..EventFilter::default()
+        })
+        .await
+    }
+
+    pub async fn history(
+        &self,
+        mut filter: EventFilter,
+    ) -> Result<Vec<AuditEvent>, ApplicationError> {
+        if let Some(effort) = &filter.effort_id {
+            filter.effort_id = Some(self.get_effort(effort).await?.id);
+        }
+        Ok(self.store.list_events(&self.workspace.id, &filter).await?)
     }
 
     pub async fn claim_next(
@@ -1307,6 +1320,43 @@ mod tests {
         let status = service.status("cache").await.unwrap();
         assert_eq!(status.frontier.len(), 1);
         assert!(!status.readiness.ready);
+    }
+
+    #[tokio::test]
+    async fn filters_history_without_session_data() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = service
+            .create_effort(CreateEffort {
+                slug: "history".into(),
+                title: "History".into(),
+                destination: "Test history filters".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        let node = add_test_node(&service, &effort.slug, NodeKind::Action, "recorded").await;
+
+        let events = service
+            .history(EventFilter {
+                effort_id: Some(effort.slug),
+                entity_type: Some("node".into()),
+                entity_id: Some(node.id),
+                actor_id: Some("test".into()),
+                event_type: Some("node_created".into()),
+                occurred_from: Some(node.created_at.clone()),
+                occurred_to: Some(node.created_at),
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            serde_json::to_value(&events[0])
+                .unwrap()
+                .get("session_id")
+                .is_none()
+        );
     }
 
     #[tokio::test]

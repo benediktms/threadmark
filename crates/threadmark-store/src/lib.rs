@@ -9,9 +9,11 @@ use sqlx::{
 };
 use thiserror::Error;
 use threadmark_domain::{
-    AuditEvent, Claim, Confidence, Edge, Effort, ExitCriterion, Finding, FogPatch, GraphSnapshot,
-    Lifecycle, Node, NodeRevision, Reversibility, RiskLevel, Source, Uncertainty, Workspace,
+    AuditEvent, Claim, Confidence, Edge, Effort, EventFilter, ExitCriterion, Finding, FogPatch,
+    GraphSnapshot, Lifecycle, Node, NodeRevision, Reversibility, RiskLevel, Source, Uncertainty,
+    Workspace,
 };
+use ulid::Ulid;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -455,27 +457,52 @@ impl Store {
         let timestamp: String = sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
             .fetch_one(&mut *tx)
             .await?;
-        sqlx::query(
-            "UPDATE nodes SET lifecycle='open',updated_at=? \
-             WHERE effort_id=? AND lifecycle='in_progress' \
-             AND id IN (SELECT node_id FROM claims \
-                        WHERE released_at IS NULL AND julianday(lease_expires_at)<=julianday(?))",
+        let claims = sqlx::query(
+            "SELECT claims.id,claims.node_id FROM claims \
+             JOIN nodes ON nodes.id=claims.node_id \
+             WHERE nodes.effort_id=? AND claims.released_at IS NULL \
+             AND julianday(claims.lease_expires_at)<=julianday(?)",
         )
-        .bind(&timestamp)
         .bind(effort_id)
         .bind(&timestamp)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
-        sqlx::query(
-            "UPDATE claims SET released_at=?,release_reason='lease expired' \
-             WHERE released_at IS NULL AND julianday(lease_expires_at)<=julianday(?) \
-             AND node_id IN (SELECT id FROM nodes WHERE effort_id=?)",
-        )
-        .bind(&timestamp)
-        .bind(&timestamp)
-        .bind(effort_id)
-        .execute(&mut *tx)
-        .await?;
+        for claim in claims {
+            let claim_id: String = claim.get("id");
+            let node_id: String = claim.get("node_id");
+            sqlx::query(
+                "UPDATE claims SET released_at=?,release_reason='lease expired' WHERE id=?",
+            )
+            .bind(&timestamp)
+            .bind(&claim_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE nodes SET lifecycle='open',updated_at=? \
+                 WHERE id=? AND lifecycle='in_progress'",
+            )
+            .bind(&timestamp)
+            .bind(&node_id)
+            .execute(&mut *tx)
+            .await?;
+            insert_event(
+                &mut tx,
+                &AuditEvent {
+                    id: Ulid::new().to_string(),
+                    effort_id: Some(effort_id.into()),
+                    actor_id: "system".into(),
+                    session_id: None,
+                    event_type: "claim_expired".into(),
+                    entity_type: "claim".into(),
+                    entity_id: claim_id,
+                    before: None,
+                    after: None,
+                    reason: Some("lease expired".into()),
+                    occurred_at: timestamp.clone(),
+                },
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -785,11 +812,40 @@ impl Store {
         Ok(patches)
     }
 
-    pub async fn list_events(&self, effort_id: &str) -> Result<Vec<AuditEvent>, StoreError> {
-        let rows = sqlx::query("SELECT * FROM events WHERE effort_id=? ORDER BY occurred_at,id")
-            .bind(effort_id)
-            .fetch_all(&self.pool)
-            .await?;
+    pub async fn list_events(
+        &self,
+        workspace_id: &str,
+        filter: &EventFilter,
+    ) -> Result<Vec<AuditEvent>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT events.* FROM events JOIN efforts ON efforts.id=events.effort_id \
+             WHERE efforts.workspace_id=? \
+             AND (? IS NULL OR events.effort_id=?) \
+             AND (? IS NULL OR events.entity_type=?) \
+             AND (? IS NULL OR events.entity_id=?) \
+             AND (? IS NULL OR events.actor_id=?) \
+             AND (? IS NULL OR events.event_type=?) \
+             AND (? IS NULL OR events.occurred_at>=?) \
+             AND (? IS NULL OR events.occurred_at<=?) \
+             ORDER BY events.occurred_at,events.id",
+        )
+        .bind(workspace_id)
+        .bind(&filter.effort_id)
+        .bind(&filter.effort_id)
+        .bind(&filter.entity_type)
+        .bind(&filter.entity_type)
+        .bind(&filter.entity_id)
+        .bind(&filter.entity_id)
+        .bind(&filter.actor_id)
+        .bind(&filter.actor_id)
+        .bind(&filter.event_type)
+        .bind(&filter.event_type)
+        .bind(&filter.occurred_from)
+        .bind(&filter.occurred_from)
+        .bind(&filter.occurred_to)
+        .bind(&filter.occurred_to)
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter().map(row_to_event).collect()
     }
 
@@ -1169,6 +1225,13 @@ mod tests {
                 .await
                 .unwrap();
         assert!(released_at.is_some());
+        let expired: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE event_type='claim_expired' AND entity_id='claim'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(expired, 1);
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 threadmark-domain = { path = "../threadmark-domain" }
+ulid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
