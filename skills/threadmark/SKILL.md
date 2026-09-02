@@ -77,12 +77,13 @@ invalidation, and commit only the reviewed propagation. Then return to
 
 ### Verify and hand off
 
-Run lint and readiness after every mutation and before handoff. A failed check
+Run lint and readiness after every mutation and before completion. A failed check
 chooses the next state: open node -> **Work**; active fog -> **Reduce fog**;
 challenged or review-required conclusion -> **Reconcile**; human decision ->
-**Stop**. When all required checks pass, generate and review the handoff, then
-complete the effort through `threadmark_complete_effort`. Stop at the
-specification boundary unless execution is explicitly in scope.
+**Stop**. When all required checks pass, complete the effort through
+`threadmark_complete_effort`. If the user requests a handoff, use an MCP handoff
+tool when one is available; otherwise enter **Stop** and report that capability
+gap. Stop at the specification boundary unless execution is explicitly in scope.
 
 ## Invariants
 
