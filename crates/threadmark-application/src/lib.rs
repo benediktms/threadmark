@@ -89,6 +89,13 @@ pub struct AddEdge {
     pub expected_version: Option<i64>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct WorkspaceMarker {
+    schema_version: i64,
+    workspace_id: String,
+    name: String,
+}
+
 impl Service {
     pub async fn init(root: &Path, name: &str) -> Result<Self, ApplicationError> {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -98,10 +105,12 @@ impl Service {
         }
         fs::create_dir_all(root.join(".threadmark/exports"))?;
         let workspace_id = id();
-        let marker = format!(
-            "schema_version = {SCHEMA_VERSION}\nworkspace_id = \"{workspace_id}\"\nname = \"{}\"\n",
-            escape_toml(name)
-        );
+        let marker = toml::to_string(&WorkspaceMarker {
+            schema_version: SCHEMA_VERSION,
+            workspace_id: workspace_id.clone(),
+            name: name.into(),
+        })
+        .map_err(|error| ApplicationError::InvalidMarker(error.to_string()))?;
         fs::write(&marker_path, marker)?;
         let timestamp = now();
         let workspace = Workspace {
@@ -124,11 +133,27 @@ impl Service {
 
     pub async fn open(start: &Path) -> Result<Self, ApplicationError> {
         let root = discover_root(start)?;
-        let marker = fs::read_to_string(root.join(MARKER))?;
-        let workspace_id = marker_value(&marker, "workspace_id")?;
+        let marker: WorkspaceMarker = toml::from_str(&fs::read_to_string(root.join(MARKER))?)
+            .map_err(|error| ApplicationError::InvalidMarker(error.to_string()))?;
+        if marker.schema_version > SCHEMA_VERSION {
+            return Err(ApplicationError::InvalidMarker(format!(
+                "schema version {} is newer than supported {SCHEMA_VERSION}",
+                marker.schema_version
+            )));
+        }
+        let timestamp = now();
+        let workspace = Workspace {
+            id: marker.workspace_id.clone(),
+            name: marker.name,
+            root_uri: root.to_string_lossy().into_owned(),
+            schema_version: marker.schema_version,
+            created_at: timestamp.clone(),
+            updated_at: timestamp,
+        };
         let database_path = database_path(&root);
         let store = Store::connect(&database_path).await?;
-        let workspace = store.get_workspace(&workspace_id).await?;
+        store.reconcile_workspace(&workspace).await?;
+        let workspace = store.get_workspace(&marker.workspace_id).await?;
         Ok(Self {
             root,
             workspace,
@@ -989,20 +1014,6 @@ fn database_path(root: &Path) -> PathBuf {
     common.join("threadmark/state.sqlite3")
 }
 
-fn marker_value(marker: &str, key: &str) -> Result<String, ApplicationError> {
-    marker
-        .lines()
-        .find_map(|line| {
-            let (candidate, value) = line.split_once('=')?;
-            (candidate.trim() == key).then(|| value.trim().trim_matches('"').to_owned())
-        })
-        .ok_or_else(|| ApplicationError::InvalidMarker(format!("missing {key}")))
-}
-
-fn escape_toml(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1051,5 +1062,172 @@ mod tests {
         let status = service.status("cache").await.unwrap();
         assert_eq!(status.frontier.len(), 1);
         assert!(!status.readiness.ready);
+    }
+
+    #[tokio::test]
+    async fn opens_a_marker_without_local_database_and_marker_metadata_wins() {
+        let directory = TempDir::new().unwrap();
+        let marker_directory = directory.path().join(".threadmark");
+        std::fs::create_dir_all(&marker_directory).unwrap();
+        std::fs::write(marker_directory.join("workspace.toml"), "schema_version = 1\nworkspace_id = \"01TESTWORKSPACE000000000000\"\nname = \"committed\"\n").unwrap();
+
+        let service = Service::open(directory.path()).await.unwrap();
+        assert_eq!(service.workspace().name, "committed");
+
+        std::fs::write(marker_directory.join("workspace.toml"), "schema_version = 1\nworkspace_id = \"01TESTWORKSPACE000000000000\"\nname = \"renamed\"\n").unwrap();
+        let service = Service::open(directory.path()).await.unwrap();
+        assert_eq!(service.workspace().name, "renamed");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_newer_marker_schema() {
+        let directory = TempDir::new().unwrap();
+        let marker_directory = directory.path().join(".threadmark");
+        std::fs::create_dir_all(&marker_directory).unwrap();
+        std::fs::write(marker_directory.join("workspace.toml"), "schema_version = 2\nworkspace_id = \"01TESTWORKSPACE000000000000\"\nname = \"future\"\n").unwrap();
+
+        assert!(matches!(
+            Service::open(directory.path()).await,
+            Err(ApplicationError::InvalidMarker(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn preserves_escaped_workspace_names() {
+        let directory = TempDir::new().unwrap();
+        let name = "quoted \"name\" with \\ slash\nand newline";
+        Service::init(directory.path(), name).await.unwrap();
+
+        let service = Service::open(directory.path()).await.unwrap();
+        assert_eq!(service.workspace().name, name);
+    }
+
+    #[tokio::test]
+    async fn preserves_workspace_creation_time_when_reopened() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let created_at = service.workspace().created_at.clone();
+
+        let service = Service::open(directory.path()).await.unwrap();
+        assert_eq!(service.workspace().created_at, created_at);
+    }
+
+    #[tokio::test]
+    async fn preserves_workspace_updated_time_when_reopened_unchanged() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let updated_at = service.workspace().updated_at.clone();
+
+        let service = Service::open(directory.path()).await.unwrap();
+        assert_eq!(service.workspace().updated_at, updated_at);
+    }
+
+    #[tokio::test]
+    async fn migrates_efforts_when_the_marker_replaces_a_workspace_id() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let old_id = service.workspace().id.clone();
+        service
+            .create_effort(CreateEffort {
+                slug: "effort".into(),
+                title: "Effort".into(),
+                destination: "Destination".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        std::fs::write(
+            directory.path().join(MARKER),
+            "schema_version = 1\nworkspace_id = \"01TESTWORKSPACE000000000000\"\nname = \"test\"\n",
+        )
+        .unwrap();
+
+        let service = Service::open(directory.path()).await.unwrap();
+        assert_ne!(service.workspace().id, old_id);
+        assert_eq!(service.list_efforts().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn migrates_a_root_matched_workspace_when_the_marker_id_already_exists() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let legacy_effort = service
+            .create_effort(CreateEffort {
+                slug: "effort".into(),
+                title: "Effort".into(),
+                destination: "Destination".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        service
+            .create_effort(CreateEffort {
+                slug: format!("effort-{}", legacy_effort.id),
+                title: "Existing suffix".into(),
+                destination: "Destination".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        let timestamp = now();
+        service
+            .store
+            .create_workspace(&Workspace {
+                id: "01TESTWORKSPACE000000000000".into(),
+                name: "test".into(),
+                root_uri: "other-worktree".into(),
+                schema_version: SCHEMA_VERSION,
+                created_at: timestamp.clone(),
+                updated_at: timestamp.clone(),
+            })
+            .await
+            .unwrap();
+        service
+            .store
+            .create_effort(
+                &Effort {
+                    id: "01TARGETEFFORT00000000000000".into(),
+                    workspace_id: "01TESTWORKSPACE000000000000".into(),
+                    slug: "effort".into(),
+                    title: "Target effort".into(),
+                    destination: "Destination".into(),
+                    scope_notes: String::new(),
+                    status: EffortStatus::Active,
+                    version: 1,
+                    created_at: timestamp.clone(),
+                    updated_at: timestamp.clone(),
+                },
+                &event(
+                    None,
+                    "test",
+                    None,
+                    "effort_created",
+                    "effort",
+                    "01TARGETEFFORT00000000000000",
+                    None,
+                    None,
+                    None,
+                    &timestamp,
+                ),
+            )
+            .await
+            .unwrap();
+        std::fs::write(
+            directory.path().join(MARKER),
+            "schema_version = 1\nworkspace_id = \"01TESTWORKSPACE000000000000\"\nname = \"test\"\n",
+        )
+        .unwrap();
+
+        let service = Service::open(directory.path()).await.unwrap();
+        let efforts = service.list_efforts().await.unwrap();
+        assert_eq!(efforts.len(), 3);
+        assert!(
+            efforts
+                .iter()
+                .any(|effort| effort.slug == format!("effort-{}-2", legacy_effort.id))
+        );
     }
 }

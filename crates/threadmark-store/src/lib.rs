@@ -76,20 +76,123 @@ impl Store {
         Ok(())
     }
 
+    pub async fn reconcile_workspace(&self, workspace: &Workspace) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let root_match = sqlx::query("SELECT * FROM workspaces WHERE root_uri = ?")
+            .bind(&workspace.root_uri)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(row_to_workspace);
+        let target = sqlx::query("SELECT * FROM workspaces WHERE id = ?")
+            .bind(&workspace.id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(row_to_workspace);
+
+        if let Some(existing) = target {
+            if existing.name != workspace.name
+                || existing.root_uri != workspace.root_uri
+                || existing.schema_version != workspace.schema_version
+            {
+                sqlx::query(
+                    "UPDATE workspaces SET name=?,root_uri=?,schema_version=?,updated_at=? WHERE id=?",
+                )
+                .bind(&workspace.name)
+                .bind(&workspace.root_uri)
+                .bind(workspace.schema_version)
+                .bind(&workspace.updated_at)
+                .bind(&workspace.id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        } else if let Some(existing) = root_match.as_ref() {
+            let metadata_changed = existing.name != workspace.name
+                || existing.root_uri != workspace.root_uri
+                || existing.schema_version != workspace.schema_version;
+            sqlx::query(
+                "INSERT INTO workspaces(id,name,root_uri,schema_version,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            )
+            .bind(&workspace.id)
+            .bind(&workspace.name)
+            .bind(&workspace.root_uri)
+            .bind(workspace.schema_version)
+            .bind(&existing.created_at)
+            .bind(if metadata_changed { &workspace.updated_at } else { &existing.updated_at })
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "INSERT INTO workspaces(id,name,root_uri,schema_version,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            )
+            .bind(&workspace.id)
+            .bind(&workspace.name)
+            .bind(&workspace.root_uri)
+            .bind(workspace.schema_version)
+            .bind(&workspace.created_at)
+            .bind(&workspace.updated_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if let Some(existing) = root_match.filter(|existing| existing.id != workspace.id) {
+            let conflicts = sqlx::query(
+                "SELECT id,slug FROM efforts legacy WHERE workspace_id = ? \
+                 AND EXISTS (SELECT 1 FROM efforts target WHERE target.workspace_id = ? AND target.slug = legacy.slug) \
+                 ORDER BY id",
+            )
+            .bind(&existing.id)
+            .bind(&workspace.id)
+            .fetch_all(&mut *tx)
+            .await?;
+            for conflict in conflicts {
+                let id: String = conflict.get("id");
+                let slug: String = conflict.get("slug");
+                let mut suffix = 1;
+                loop {
+                    let candidate = if suffix == 1 {
+                        format!("{slug}-{id}")
+                    } else {
+                        format!("{slug}-{id}-{suffix}")
+                    };
+                    let exists: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM efforts WHERE workspace_id IN (?, ?) AND slug = ?",
+                    )
+                    .bind(&existing.id)
+                    .bind(&workspace.id)
+                    .bind(&candidate)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if exists == 0 {
+                        sqlx::query("UPDATE efforts SET slug = ? WHERE id = ?")
+                            .bind(candidate)
+                            .bind(id)
+                            .execute(&mut *tx)
+                            .await?;
+                        break;
+                    }
+                    suffix += 1;
+                }
+            }
+            sqlx::query("UPDATE efforts SET workspace_id = ? WHERE workspace_id = ?")
+                .bind(&workspace.id)
+                .bind(&existing.id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM workspaces WHERE id = ?")
+                .bind(&existing.id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn get_workspace(&self, id: &str) -> Result<Workspace, StoreError> {
         let row = sqlx::query("SELECT * FROM workspaces WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?
             .ok_or(StoreError::NotFound)?;
-        Ok(Workspace {
-            id: row.get("id"),
-            name: row.get("name"),
-            root_uri: row.get("root_uri"),
-            schema_version: row.get("schema_version"),
-            created_at: row.get("created_at"),
-            updated_at: row.get("updated_at"),
-        })
+        Ok(row_to_workspace(row))
     }
 
     pub async fn create_effort(
@@ -632,6 +735,17 @@ async fn insert_event(
     Ok(())
 }
 
+fn row_to_workspace(row: SqliteRow) -> Workspace {
+    Workspace {
+        id: row.get("id"),
+        name: row.get("name"),
+        root_uri: row.get("root_uri"),
+        schema_version: row.get("schema_version"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
 fn row_to_effort(row: SqliteRow) -> Result<Effort, StoreError> {
     Ok(Effort {
         id: row.get("id"),
@@ -796,4 +910,46 @@ fn parse_optional_json(
     value: Option<String>,
 ) -> Result<Option<Value>, StoreError> {
     value.map(|value| parse_json(field, value)).transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+    use threadmark_domain::Workspace;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn reconciles_concurrent_first_opens() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let first = Store::connect(&path).await.unwrap();
+        let second = Store::connect(&path).await.unwrap();
+        let workspace = |root_uri: &str| Workspace {
+            id: "01TESTWORKSPACE000000000000".into(),
+            name: "test".into(),
+            root_uri: root_uri.into(),
+            schema_version: 1,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+
+        let first_workspace = workspace("first-worktree");
+        let second_workspace = workspace("second-worktree");
+        let (first_result, second_result) = tokio::join!(
+            first.reconcile_workspace(&first_workspace),
+            second.reconcile_workspace(&second_workspace),
+        );
+
+        first_result.unwrap();
+        second_result.unwrap();
+        assert_eq!(
+            first
+                .get_workspace("01TESTWORKSPACE000000000000")
+                .await
+                .unwrap()
+                .id,
+            "01TESTWORKSPACE000000000000"
+        );
+    }
 }
