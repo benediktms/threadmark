@@ -368,11 +368,10 @@ impl Store {
         if let Some(claimant) = claimant {
             let claim = sqlx::query(
                 "SELECT 1 FROM claims WHERE node_id=? AND claimant=? \
-                 AND released_at IS NULL AND lease_expires_at>?",
+                 AND released_at IS NULL AND julianday(lease_expires_at)>julianday('now')",
             )
             .bind(&node.id)
             .bind(claimant)
-            .bind(&node.updated_at)
             .fetch_optional(&mut *tx)
             .await?;
             if claim.is_none() {
@@ -481,11 +480,10 @@ impl Store {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
             "SELECT node_id FROM claims WHERE id=? AND claimant=? \
-             AND released_at IS NULL AND lease_expires_at>?",
+             AND released_at IS NULL AND julianday(lease_expires_at)>julianday('now')",
         )
         .bind(claim_id)
         .bind(claimant)
-        .bind(now)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| StoreError::ClaimNotOwned(claimant.into()))?;
@@ -518,7 +516,7 @@ impl Store {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query(
             "UPDATE claims SET heartbeat_at=?,lease_expires_at=? \
-             WHERE id=? AND claimant=? AND released_at IS NULL AND lease_expires_at>? \
+             WHERE id=? AND claimant=? AND released_at IS NULL AND julianday(lease_expires_at)>julianday('now') \
              AND EXISTS (SELECT 1 FROM nodes JOIN efforts ON efforts.id=nodes.effort_id \
                          WHERE nodes.id=claims.node_id AND efforts.status='active')",
         )

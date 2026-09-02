@@ -283,7 +283,7 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
         "threadmark_resolve_node" => {
             let confidence = parse_optional::<Confidence>(args, "confidence")?;
             let (node, version) = service
-                .resolve_claimed_node(
+                .resolve_harness_node(
                     required(args, "effort")?,
                     required(args, "node")?,
                     harness_claimant()?,
@@ -512,7 +512,7 @@ fn claim_schema(with_node: bool) -> Value {
 fn harness_claimant() -> Result<&'static str> {
     harness_claimant_for(
         env::var_os("CODEX_THREAD_ID").is_some(),
-        env::var_os("CLAUDE_CODE").is_some(),
+        env::var_os("CLAUDECODE").is_some(),
     )
 }
 
@@ -520,7 +520,7 @@ fn harness_claimant_for(codex: bool, claude: bool) -> Result<&'static str> {
     match (codex, claude) {
         (true, false) => Ok("openai-codex"),
         (false, true) => Ok("claude-code"),
-        _ => anyhow::bail!("Threadmark MCP requires exactly one of CODEX_THREAD_ID or CLAUDE_CODE"),
+        _ => anyhow::bail!("Threadmark MCP requires exactly one of CODEX_THREAD_ID or CLAUDECODE"),
     }
 }
 

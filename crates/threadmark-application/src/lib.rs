@@ -591,6 +591,36 @@ impl Service {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_harness_node(
+        &self,
+        effort: &str,
+        selector: &str,
+        claimant: &str,
+        body: String,
+        payload: Option<Value>,
+        confidence: Option<Confidence>,
+        confidence_reason: Option<String>,
+        reason: &str,
+        expected_version: Option<i64>,
+    ) -> Result<(Node, i64), ApplicationError> {
+        let node = self.get_node(effort, selector).await?;
+        self.resolve_node_inner(
+            effort,
+            selector,
+            claimant,
+            None,
+            body,
+            payload,
+            confidence,
+            confidence_reason,
+            reason,
+            expected_version,
+            node.claimable().then_some(claimant),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_node_inner(
         &self,
         effort: &str,
@@ -1457,6 +1487,10 @@ mod tests {
             service.heartbeat_claim(&claim.id, "claude-code", 30).await,
             Err(ApplicationError::Store(StoreError::ClaimNotOwned(_)))
         ));
+        service
+            .heartbeat_claim(&claim.id, "openai-codex", 30)
+            .await
+            .unwrap();
         assert!(matches!(
             service
                 .resolve_claimed_node(
@@ -1488,6 +1522,46 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_claimable_nodes_resolve_without_a_claim() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = service
+            .create_effort(CreateEffort {
+                slug: "evidence".into(),
+                title: "Evidence".into(),
+                destination: "Test evidence resolution".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        let evidence = add_test_node(&service, &effort.slug, NodeKind::Evidence, "evidence").await;
+
+        service
+            .resolve_harness_node(
+                &effort.slug,
+                &evidence.id,
+                "openai-codex",
+                "recorded".into(),
+                None,
+                None,
+                None,
+                "recorded",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .get_node(&effort.slug, &evidence.id)
+                .await
+                .unwrap()
+                .lifecycle,
+            Lifecycle::Resolved
+        );
     }
 
     #[tokio::test]
