@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    path::{Path, PathBuf},
+    process::Command as ProcessCommand,
+};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -19,8 +22,8 @@ use tracing_subscriber::EnvFilter;
     about = "Durable reasoning graphs for humans and agents"
 )]
 struct Cli {
-    #[arg(long, global = true, default_value = ".")]
-    workspace: PathBuf,
+    #[arg(long, global = true)]
+    workspace: Option<PathBuf>,
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -365,8 +368,15 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
+    let workspace = match cli.workspace {
+        Some(workspace) => workspace,
+        None if matches!(&cli.command, Command::Init { .. }) => {
+            init_workspace(&std::env::current_dir()?)
+        }
+        None => PathBuf::from("."),
+    };
     if let Command::Init { name } = &cli.command {
-        let service = Service::init(&cli.workspace, name).await?;
+        let service = Service::init(&workspace, name).await?;
         return output(cli.json, service.workspace(), || {
             format!(
                 "Initialized Threadmark workspace {} ({})",
@@ -375,8 +385,19 @@ async fn main() -> Result<()> {
             )
         });
     }
-    let service = Service::open(&cli.workspace).await?;
+    let service = Service::open(&workspace).await?;
     dispatch(&service, cli.command, cli.json).await
+}
+
+fn init_workspace(current_dir: &Path) -> PathBuf {
+    ProcessCommand::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(current_dir)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+        .unwrap_or_else(|| current_dir.to_path_buf())
 }
 
 async fn dispatch(service: &Service, command: Command, json_output: bool) -> Result<()> {
@@ -1106,4 +1127,22 @@ fn render_invalidation(preview: &threadmark_domain::InvalidationPreview) -> Stri
         lines.push(format!("reopen question: {question}"));
     }
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_defaults_to_the_git_root() {
+        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let expected = crate_dir
+            .ancestors()
+            .nth(2)
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+
+        assert_eq!(init_workspace(&crate_dir.join("src")), expected);
+    }
 }

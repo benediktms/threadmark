@@ -57,16 +57,16 @@ threadmark claim next architecture --actor codex
 threadmark status architecture
 ```
 
-Use `--json` on read commands for automation. The MCP server always needs the
-initialized project root explicitly; it does not search below its workspace
-path. Register it with Codex from that root:
+Use `--json` on read commands for automation. Register the MCP server once
+globally; it uses the session working directory:
 
 ```sh
-codex mcp add threadmark -- threadmark-mcp --workspace "$(pwd -P)"
+codex mcp add threadmark -- threadmark-mcp --workspace .
 ```
 
-For a nested project, pass that project's path instead (for example,
-`--workspace "$(pwd -P)/beholder"`).
+`threadmark init` defaults to the Git repository root, so this configuration
+works from the root or any subdirectory. Pass `--workspace <path>` only when
+you intentionally want a nested workspace.
 
 ## Repository layout
 
