@@ -46,6 +46,13 @@ pub struct Store {
     pool: SqlitePool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum ClaimGuard<'a> {
+    None,
+    MustOwn(&'a str),
+    OwnIfClaimed(&'a str),
+}
+
 impl Store {
     pub async fn connect(path: &Path) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent() {
@@ -361,20 +368,21 @@ impl Store {
         revision: Option<&NodeRevision>,
         event: &AuditEvent,
         expected_version: i64,
-        claimant: Option<&str>,
+        claim_guard: ClaimGuard<'_>,
     ) -> Result<i64, StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         check_version(&mut tx, &node.effort_id, expected_version).await?;
-        if let Some(claimant) = claimant {
-            let claim = sqlx::query(
-                "SELECT 1 FROM claims WHERE node_id=? AND claimant=? \
+        if let ClaimGuard::MustOwn(claimant) | ClaimGuard::OwnIfClaimed(claimant) = claim_guard {
+            let owner: Option<String> = sqlx::query_scalar(
+                "SELECT claimant FROM claims WHERE node_id=? \
                  AND released_at IS NULL AND julianday(lease_expires_at)>julianday('now')",
             )
             .bind(&node.id)
-            .bind(claimant)
             .fetch_optional(&mut *tx)
             .await?;
-            if claim.is_none() {
+            if owner.as_deref().is_some_and(|owner| owner != claimant)
+                || (owner.is_none() && matches!(claim_guard, ClaimGuard::MustOwn(_)))
+            {
                 return Err(StoreError::ClaimNotOwned(claimant.into()));
             }
         }

@@ -18,7 +18,7 @@ use threadmark_domain::{
     ReadinessReport, RiskLevel, Source, SourceKind, SourceTrust, Validity, Workspace,
     calculate_frontier, evaluate_readiness, lint_graph, preview_invalidation, validate_edge,
 };
-use threadmark_store::{Store, StoreError};
+use threadmark_store::{ClaimGuard, Store, StoreError};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use ulid::Ulid;
 
@@ -559,7 +559,11 @@ impl Service {
             confidence_reason,
             reason,
             expected_version,
-            node.claimable().then_some(actor_id),
+            if node.claimable() {
+                ClaimGuard::OwnIfClaimed(actor_id)
+            } else {
+                ClaimGuard::None
+            },
         )
         .await
     }
@@ -588,7 +592,7 @@ impl Service {
             confidence_reason,
             reason,
             expected_version,
-            Some(claimant),
+            ClaimGuard::MustOwn(claimant),
         )
         .await
     }
@@ -618,7 +622,11 @@ impl Service {
             confidence_reason,
             reason,
             expected_version,
-            node.claimable().then_some(claimant),
+            if node.claimable() {
+                ClaimGuard::MustOwn(claimant)
+            } else {
+                ClaimGuard::None
+            },
         )
         .await
     }
@@ -636,7 +644,7 @@ impl Service {
         confidence_reason: Option<String>,
         reason: &str,
         expected_version: Option<i64>,
-        claimant: Option<&str>,
+        claim_guard: ClaimGuard<'_>,
     ) -> Result<(Node, i64), ApplicationError> {
         let effort = self.active_effort(effort).await?;
         let expected = expected_version.unwrap_or(effort.version);
@@ -668,7 +676,7 @@ impl Service {
         );
         let version = self
             .store
-            .update_node(&node, Some(&revision), &audit, expected, claimant)
+            .update_node(&node, Some(&revision), &audit, expected, claim_guard)
             .await?;
         Ok((node, version))
     }
@@ -709,7 +717,7 @@ impl Service {
         );
         let version = self
             .store
-            .update_node(&node, Some(&revision), &audit, expected, None)
+            .update_node(&node, Some(&revision), &audit, expected, ClaimGuard::None)
             .await?;
         Ok((node, version))
     }
@@ -1458,6 +1466,62 @@ mod tests {
             service.complete_effort(&effort.slug, "test", None).await,
             Err(ApplicationError::Store(StoreError::ActiveClaims))
         ));
+    }
+
+    #[tokio::test]
+    async fn resolves_an_unclaimed_in_progress_node() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = service
+            .create_effort(CreateEffort {
+                slug: "in-progress".into(),
+                title: "In progress".into(),
+                destination: "Finish".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        let (node, _) = service
+            .add_node(AddNode {
+                effort: effort.slug.clone(),
+                node: NewNode {
+                    kind: NodeKind::Action,
+                    title: "Already in progress".into(),
+                    summary: String::new(),
+                    body: String::new(),
+                    payload: json!({}),
+                    lifecycle: Lifecycle::InProgress,
+                    confidence: None,
+                    confidence_reason: None,
+                    reversibility: None,
+                    impact: None,
+                    uncertainty: None,
+                    cost_of_wrong: None,
+                },
+                actor_id: "test".into(),
+                session_id: None,
+                expected_version: None,
+            })
+            .await
+            .unwrap();
+
+        let (resolved, _) = service
+            .resolve_node(
+                &effort.slug,
+                &node.id,
+                "test",
+                None,
+                "done".into(),
+                None,
+                None,
+                None,
+                "done",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.lifecycle, Lifecycle::Resolved);
     }
 
     #[tokio::test]
