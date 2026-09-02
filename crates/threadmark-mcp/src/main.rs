@@ -540,6 +540,27 @@ where
         .transpose()
 }
 
+fn tool_result(value: Value, is_error: bool) -> Value {
+    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+    json!({"content":[{"type":"text","text":text}],"structuredContent":value,"isError":is_error})
+}
+
+fn rpc_result(id: Value, result: Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"result":result})
+}
+fn rpc_error(id: Value, code: i64, message: &str) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
+}
+
+async fn write_message(stdout: &mut tokio::io::Stdout, value: &Value) -> Result<()> {
+    stdout
+        .write_all(serde_json::to_string(value)?.as_bytes())
+        .await?;
+    stdout.write_all(b"\n").await?;
+    stdout.flush().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,25 +581,4 @@ mod tests {
         assert!(harness_claimant_for(false, false).is_err());
         assert!(harness_claimant_for(true, true).is_err());
     }
-}
-
-fn tool_result(value: Value, is_error: bool) -> Value {
-    let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
-    json!({"content":[{"type":"text","text":text}],"structuredContent":value,"isError":is_error})
-}
-
-fn rpc_result(id: Value, result: Value) -> Value {
-    json!({"jsonrpc":"2.0","id":id,"result":result})
-}
-fn rpc_error(id: Value, code: i64, message: &str) -> Value {
-    json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
-}
-
-async fn write_message(stdout: &mut tokio::io::Stdout, value: &Value) -> Result<()> {
-    stdout
-        .write_all(serde_json::to_string(value)?.as_bytes())
-        .await?;
-    stdout.write_all(b"\n").await?;
-    stdout.flush().await?;
-    Ok(())
 }
