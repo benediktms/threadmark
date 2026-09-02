@@ -62,13 +62,15 @@ Claim exactly one actionable frontier node before substantive investigation.
 Gather evidence, record provenance, add any newly exposed questions, then
 resolve only that node with the conclusion, alternatives rejected, confidence,
 and confidence reason. Finish with **Verify**. Independent research nodes may
-be worked in parallel.
+be worked in parallel only after the user approves the proposed parallel set.
 
 After resolving one substantive node, do not silently continue or spawn workers.
-If an independent actionable frontier remains, offer to delegate exactly one
-node. On explicit approval, the worker must claim that node before investigation,
-resolve only it, and return its evidence for the lead agent to verify. If no
-worker capability is available, stop and ask for a fresh session instead.
+When two or more independent research nodes are actionable, name the proposed
+parallel set and ask for explicit approval before delegating it. Otherwise, offer
+to delegate exactly one node. Each approved worker must claim its node before
+investigation, resolve only it, and return its evidence for the lead agent to
+verify. If no worker capability is available, stop and ask for a fresh session
+instead.
 
 After every delegated result, the lead agent must verify the resolved node,
 frontier, lint, and readiness through MCP, then inspect the worker's relevant

@@ -10,8 +10,7 @@ use sqlx::{
 use thiserror::Error;
 use threadmark_domain::{
     AuditEvent, Claim, Confidence, Edge, Effort, ExitCriterion, Finding, FogPatch, GraphSnapshot,
-    InvalidationPreview, Lifecycle, Node, NodeRevision, Reversibility, RiskLevel, Source,
-    Uncertainty, Workspace,
+    Lifecycle, Node, NodeRevision, Reversibility, RiskLevel, Source, Uncertainty, Workspace,
 };
 
 #[derive(Debug, Error)]
@@ -513,25 +512,25 @@ impl Store {
     pub async fn apply_invalidation(
         &self,
         effort_id: &str,
-        preview: &InvalidationPreview,
+        updates: &[(Node, NodeRevision)],
+        reopened_questions: &[String],
         event: &AuditEvent,
         expected_version: i64,
         now: &str,
     ) -> Result<i64, StoreError> {
         let mut tx = self.pool.begin().await?;
         check_version(&mut tx, effort_id, expected_version).await?;
-        for change in &preview.changes {
-            sqlx::query("UPDATE nodes SET validity=?,updated_at=? WHERE id=? AND effort_id=?")
-                .bind(change.to.as_str())
-                .bind(now)
-                .bind(&change.node_id)
+        for (node, revision) in updates {
+            sqlx::query("UPDATE nodes SET lifecycle=CASE WHEN ? THEN 'open' ELSE lifecycle END,validity=?,current_revision=?,updated_at=? WHERE id=? AND effort_id=?")
+                .bind(reopened_questions.contains(&node.id))
+                .bind(node.validity.as_str())
+                .bind(node.current_revision)
+                .bind(&node.updated_at)
+                .bind(&node.id)
                 .bind(effort_id)
                 .execute(&mut *tx)
                 .await?;
-        }
-        for question in &preview.reopened_questions {
-            sqlx::query("UPDATE nodes SET lifecycle='open',validity='review_required',updated_at=? WHERE id=? AND effort_id=?")
-                .bind(now).bind(question).bind(effort_id).execute(&mut *tx).await?;
+            insert_revision(&mut tx, revision).await?;
         }
         insert_event(&mut tx, event).await?;
         let version = bump_version(&mut tx, effort_id, now).await?;
@@ -985,8 +984,9 @@ fn parse_optional_json(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use tempfile::TempDir;
-    use threadmark_domain::Workspace;
+    use threadmark_domain::{AuditEvent, Lifecycle, NodeRevision, Validity, Workspace};
 
     use super::*;
 
@@ -1021,6 +1021,62 @@ mod tests {
                 .unwrap()
                 .id,
             "01TESTWORKSPACE000000000000"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidation_does_not_restore_a_released_claim_lifecycle() {
+        let directory = TempDir::new().unwrap();
+        let store = Store::connect(&directory.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces(id,name,root_uri,schema_version,created_at,updated_at) VALUES('workspace','test','test',1,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO efforts(id,workspace_id,slug,title,destination,status,version,created_at,updated_at) VALUES('effort','workspace','test','test','test','active',1,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO nodes(id,effort_id,kind,title,lifecycle,validity,current_revision,created_at,updated_at) VALUES('node','effort','action','test','in_progress','current',0,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO node_revisions(node_id,revision,body,payload_json,actor_id,created_at) VALUES('node',0,'','{}','test','now')")
+            .execute(&store.pool).await.unwrap();
+
+        let mut stale = store.get_node("effort", "node").await.unwrap();
+        stale.validity = Validity::Invalid;
+        stale.current_revision = 1;
+        sqlx::query("UPDATE nodes SET lifecycle='open' WHERE id='node'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let revision = NodeRevision {
+            node_id: stale.id.clone(),
+            revision: stale.current_revision,
+            body: String::new(),
+            payload: json!({}),
+            reason: Some("invalidated".into()),
+            actor_id: "test".into(),
+            session_id: None,
+            created_at: "later".into(),
+        };
+        let event = AuditEvent {
+            id: "event".into(),
+            effort_id: Some("effort".into()),
+            actor_id: "test".into(),
+            session_id: None,
+            event_type: "invalidation_committed".into(),
+            entity_type: "node".into(),
+            entity_id: stale.id.clone(),
+            before: None,
+            after: None,
+            reason: None,
+            occurred_at: "later".into(),
+        };
+
+        store
+            .apply_invalidation("effort", &[(stale, revision)], &[], &event, 1, "later")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_node("effort", "node").await.unwrap().lifecycle,
+            Lifecycle::Open
         );
     }
 }

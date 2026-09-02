@@ -180,10 +180,13 @@ pub fn preview_invalidation(
                 continue;
             }
             let dependent_id = edge.source_node_id.as_str();
-            if !affected.insert(dependent_id) {
-                continue;
-            }
             if let Some(dependent) = nodes.get(dependent_id) {
+                if required && dependent.lifecycle != Lifecycle::Resolved {
+                    continue;
+                }
+                if !affected.insert(dependent_id) {
+                    continue;
+                }
                 let to = if direct_assumption {
                     Validity::Undermined
                 } else {
@@ -471,5 +474,36 @@ mod tests {
         assert!(preview.changes.iter().any(|change| {
             change.node_id == "dependent" && change.to == Validity::ReviewRequired
         }));
+    }
+
+    #[test]
+    fn only_resolved_requires_dependents_are_marked_for_review() {
+        let graph = GraphSnapshot {
+            nodes: vec![
+                node("root", NodeKind::Assumption, Lifecycle::Resolved),
+                node("resolved", NodeKind::Action, Lifecycle::Resolved),
+                node("open", NodeKind::Action, Lifecycle::Open),
+                node("question", NodeKind::Question, Lifecycle::Resolved),
+            ],
+            edges: vec![
+                edge("resolved", EdgeType::Requires, "root"),
+                edge("open", EdgeType::Requires, "root"),
+                edge("open", EdgeType::Resolves, "question"),
+            ],
+            ..GraphSnapshot::default()
+        };
+
+        let preview = preview_invalidation(&graph, "root", Validity::Invalid);
+        assert!(preview
+            .changes
+            .iter()
+            .any(|change| change.node_id == "resolved" && change.to == Validity::ReviewRequired));
+        assert!(
+            !preview
+                .changes
+                .iter()
+                .any(|change| change.node_id == "open")
+        );
+        assert!(preview.reopened_questions.is_empty());
     }
 }
