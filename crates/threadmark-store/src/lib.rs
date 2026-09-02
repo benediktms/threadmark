@@ -13,6 +13,7 @@ use threadmark_domain::{
     GraphSnapshot, Lifecycle, Node, NodeRevision, Reversibility, RiskLevel, Source, Uncertainty,
     Workspace,
 };
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use ulid::Ulid;
 
 #[derive(Debug, Error)]
@@ -29,6 +30,8 @@ pub enum StoreError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("invalid RFC 3339 timestamp: {0}")]
+    InvalidTimestamp(String),
     #[error("active claim already exists for node {0}")]
     ClaimConflict(String),
     #[error("effort is not active")]
@@ -817,6 +820,16 @@ impl Store {
         workspace_id: &str,
         filter: &EventFilter,
     ) -> Result<Vec<AuditEvent>, StoreError> {
+        let occurred_from = filter
+            .occurred_from
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?;
+        let occurred_to = filter
+            .occurred_to
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?;
         let mut query = QueryBuilder::<Sqlite>::new(
             "SELECT events.* FROM events JOIN efforts ON efforts.id=events.effort_id \
              WHERE efforts.workspace_id=",
@@ -837,24 +850,25 @@ impl Store {
         if let Some(value) = &filter.event_type {
             query.push(" AND events.event_type=").push_bind(value);
         }
-        if let Some(value) = &filter.occurred_from {
-            query
-                .push(" AND julianday(events.occurred_at)>=julianday(")
-                .push_bind(value)
-                .push(")");
-        }
-        if let Some(value) = &filter.occurred_to {
-            query
-                .push(" AND julianday(events.occurred_at)<=julianday(")
-                .push_bind(value)
-                .push(")");
-        }
         let rows = query
             .push(" ORDER BY events.occurred_at,events.id")
             .build()
             .fetch_all(&self.pool)
             .await?;
-        rows.into_iter().map(row_to_event).collect()
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let event = row_to_event(row)?;
+            if occurred_from.is_some() || occurred_to.is_some() {
+                let occurred_at = parse_timestamp(&event.occurred_at)?;
+                if occurred_from.is_some_and(|bound| occurred_at < bound)
+                    || occurred_to.is_some_and(|bound| occurred_at > bound)
+                {
+                    continue;
+                }
+            }
+            events.push(event);
+        }
+        Ok(events)
     }
 
     pub async fn list_sources(&self, effort_id: &str) -> Result<Vec<Source>, StoreError> {
@@ -1106,6 +1120,10 @@ fn parse_optional_json(
     value.map(|value| parse_json(field, value)).transpose()
 }
 
+fn parse_timestamp(value: &str) -> Result<OffsetDateTime, StoreError> {
+    OffsetDateTime::parse(value, &Rfc3339).map_err(|_| StoreError::InvalidTimestamp(value.into()))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1243,7 +1261,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filters_event_times_as_instants() {
+    async fn filters_event_times_as_instants_without_losing_precision() {
         let directory = TempDir::new().unwrap();
         let store = Store::connect(&directory.path().join("state.sqlite3"))
             .await
@@ -1252,7 +1270,7 @@ mod tests {
             .execute(&store.pool).await.unwrap();
         sqlx::query("INSERT INTO efforts(id,workspace_id,slug,title,destination,status,version,created_at,updated_at) VALUES('effort','workspace','test','test','test','active',1,'now','now')")
             .execute(&store.pool).await.unwrap();
-        sqlx::query("INSERT INTO events(id,effort_id,actor_id,event_type,entity_type,entity_id,occurred_at) VALUES('event','effort','test','node_created','node','node','2026-01-01T00:30:00Z')")
+        sqlx::query("INSERT INTO events(id,effort_id,actor_id,event_type,entity_type,entity_id,occurred_at) VALUES('event','effort','test','node_created','node','node','2026-01-01T00:30:00.1231Z')")
             .execute(&store.pool).await.unwrap();
 
         let events = store
@@ -1267,6 +1285,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(events.len(), 1);
+        let events = store
+            .list_events(
+                "workspace",
+                &EventFilter {
+                    occurred_from: Some("2026-01-01T00:30:00.1234Z".into()),
+                    ..EventFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(events.is_empty());
     }
 
     #[tokio::test]
