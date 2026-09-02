@@ -3,10 +3,12 @@ use std::{env, path::PathBuf, str::FromStr};
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{Value, json};
-use threadmark_application::{AddEdge, AddNode, ReopenEffort, Service};
+use threadmark_application::{AddEdge, AddNode, CreateEffort, ReopenEffort, Service};
 use threadmark_domain::{
-    Confidence, EdgeType, Lifecycle, NewEdge, NewNode, NodeKind, SourceKind, SourceTrust, Validity,
+    Confidence, EdgeType, Lifecycle, NewEdge, NewNode, NodeKind, RiskLevel, SourceKind,
+    SourceTrust, Validity,
 };
+use threadmark_export::{PortableEffort, render_handoff};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing_subscriber::EnvFilter;
 
@@ -94,6 +96,21 @@ async fn handle(service: &Service, request: &Value) -> Value {
 
 async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value> {
     match name {
+        "threadmark_create_effort" => Ok(serde_json::to_value(
+            service
+                .create_effort(CreateEffort {
+                    slug: required(args, "slug")?.into(),
+                    title: required(args, "title")?.into(),
+                    destination: required(args, "destination")?.into(),
+                    scope_notes: args
+                        .get("scope_notes")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .into(),
+                    actor_id: required(args, "actor_id")?.into(),
+                })
+                .await?,
+        )?),
         "threadmark_list_efforts" => Ok(json!({"efforts": service.list_efforts().await?})),
         "threadmark_complete_effort" => Ok(serde_json::to_value(
             service
@@ -117,6 +134,19 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
         "threadmark_get_context" => {
             let effort = required(args, "effort")?;
             Ok(serde_json::to_value(service.status(effort).await?)?)
+        }
+        "threadmark_get_snapshot" => {
+            let (effort, graph) = service.snapshot(required(args, "effort")?).await?;
+            let sources = service.sources(&effort.slug).await?;
+            Ok(json!({"effort":effort,"graph":graph,"sources":sources}))
+        }
+        "threadmark_get_history" => {
+            let effort = required(args, "effort")?;
+            if let Some(node) = args.get("node").and_then(Value::as_str) {
+                Ok(json!({"revisions": service.node_history(effort, node).await?}))
+            } else {
+                Ok(json!({"events": service.effort_history(effort).await?}))
+            }
         }
         "threadmark_get_frontier" => {
             let status = service.status(required(args, "effort")?).await?;
@@ -227,6 +257,34 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                 .await?;
             Ok(json!({"criterion":criterion,"effort_version":version}))
         }
+        "threadmark_add_fog" => {
+            let (fog, version) = service
+                .add_fog(
+                    required(args, "effort")?,
+                    required(args, "title")?.into(),
+                    required(args, "description")?.into(),
+                    args.get("anchor").and_then(Value::as_str).map(Into::into),
+                    required(args, "actor_id")?,
+                    args.get("expected_version").and_then(Value::as_i64),
+                )
+                .await?;
+            Ok(json!({"fog":fog,"effort_version":version}))
+        }
+        "threadmark_graduate_fog" => {
+            let targets = required_strings(args, "to")?;
+            let version = service
+                .graduate_fog(
+                    required(args, "effort")?,
+                    required(args, "fog")?,
+                    &targets,
+                    required(args, "actor_id")?,
+                    args.get("expected_version").and_then(Value::as_i64),
+                )
+                .await?;
+            Ok(
+                json!({"fog":required(args, "fog")?,"graduated_to":targets,"effort_version":version}),
+            )
+        }
         "threadmark_add_node" => {
             let effort = required(args, "effort")?;
             let kind = NodeKind::from_str(required(args, "kind")?).map_err(anyhow::Error::msg)?;
@@ -290,6 +348,22 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                 .await?;
             Ok(json!({"edge":edge,"effort_version":version}))
         }
+        "threadmark_propose_contradiction" => {
+            let severity =
+                parse_optional::<RiskLevel>(args, "severity")?.unwrap_or(RiskLevel::High);
+            let (finding, version) = service
+                .propose_contradiction(
+                    required(args, "effort")?,
+                    required(args, "left")?,
+                    required(args, "right")?,
+                    required(args, "detail")?.into(),
+                    severity,
+                    required(args, "actor_id")?,
+                    args.get("expected_version").and_then(Value::as_i64),
+                )
+                .await?;
+            Ok(json!({"finding":finding,"effort_version":version}))
+        }
         "threadmark_resolve_node" => {
             let confidence = parse_optional::<Confidence>(args, "confidence")?;
             let (node, version) = service
@@ -349,12 +423,35 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                 .await?;
             Ok(json!({"preview":preview,"effort_version":version}))
         }
+        "threadmark_render_handoff" => Ok(json!({
+            "handoff": render_handoff(&portable_effort(service, required(args, "effort")?).await?)
+        })),
         _ => anyhow::bail!("unknown Threadmark tool: {name}"),
     }
 }
 
+async fn portable_effort(service: &Service, effort: &str) -> Result<PortableEffort> {
+    let (effort, graph) = service.snapshot(effort).await?;
+    let sources = service.sources(&effort.slug).await?;
+    Ok(PortableEffort {
+        format_version: 1,
+        effort,
+        graph,
+        sources,
+        events: vec![],
+    })
+}
+
 fn tool_definitions() -> Vec<Value> {
     vec![
+        tool(
+            "threadmark_create_effort",
+            "Create a reasoning effort",
+            object(
+                &["slug", "title", "destination", "actor_id"],
+                json!({"slug":{"type":"string"},"title":{"type":"string"},"destination":{"type":"string"},"scope_notes":{"type":"string"},"actor_id":{"type":"string"}}),
+            ),
+        ),
         tool(
             "threadmark_list_efforts",
             "List reasoning efforts",
@@ -380,6 +477,19 @@ fn tool_definitions() -> Vec<Value> {
             "threadmark_get_context",
             "Get low-resolution effort context, readiness, frontier, and findings",
             object(&["effort"], json!({"effort":{"type":"string"}})),
+        ),
+        tool(
+            "threadmark_get_snapshot",
+            "Get the complete graph and its sources",
+            object(&["effort"], json!({"effort":{"type":"string"}})),
+        ),
+        tool(
+            "threadmark_get_history",
+            "Get effort events or one node's revisions",
+            object(
+                &["effort"],
+                json!({"effort":{"type":"string"},"node":{"type":"string"}}),
+            ),
         ),
         tool(
             "threadmark_get_frontier",
@@ -455,6 +565,22 @@ fn tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
+            "threadmark_add_fog",
+            "Record an active fog patch",
+            object(
+                &["effort", "title", "description", "actor_id"],
+                json!({"effort":{"type":"string"},"title":{"type":"string"},"description":{"type":"string"},"anchor":{"type":"string"},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
+            ),
+        ),
+        tool(
+            "threadmark_graduate_fog",
+            "Graduate a fog patch to concrete nodes",
+            object(
+                &["effort", "fog", "to", "actor_id"],
+                json!({"effort":{"type":"string"},"fog":{"type":"string"},"to":{"type":"array","items":{"type":"string"},"minItems":1},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
+            ),
+        ),
+        tool(
             "threadmark_add_node",
             "Add a typed reasoning node",
             object(
@@ -468,6 +594,14 @@ fn tool_definitions() -> Vec<Value> {
             object(
                 &["effort", "source", "type", "target", "actor_id"],
                 json!({"effort":{"type":"string"},"source":{"type":"string"},"type":{"type":"string"},"target":{"type":"string"},"rationale":{"type":"string"},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
+            ),
+        ),
+        tool(
+            "threadmark_propose_contradiction",
+            "Propose a contradiction finding between two nodes",
+            object(
+                &["effort", "left", "right", "detail", "actor_id"],
+                json!({"effort":{"type":"string"},"left":{"type":"string"},"right":{"type":"string"},"detail":{"type":"string"},"severity":{"type":"string"},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
             ),
         ),
         tool(
@@ -501,6 +635,11 @@ fn tool_definitions() -> Vec<Value> {
                 &["effort", "node", "actor_id", "reason"],
                 json!({"effort":{"type":"string"},"node":{"type":"string"},"target":{"type":"string"},"actor_id":{"type":"string"},"reason":{"type":"string"},"expected_version":{"type":"integer"}}),
             ),
+        ),
+        tool(
+            "threadmark_render_handoff",
+            "Render the deterministic implementation handoff",
+            object(&["effort"], json!({"effort":{"type":"string"}})),
         ),
     ]
 }
@@ -558,6 +697,20 @@ fn required<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
         .with_context(|| format!("missing string argument: {key}"))
+}
+
+fn required_strings(args: &Value, key: &str) -> Result<Vec<String>> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .with_context(|| format!("missing string array argument: {key}"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(Into::into)
+                .with_context(|| format!("invalid string array argument: {key}"))
+        })
+        .collect()
 }
 
 fn parse_optional<T>(args: &Value, key: &str) -> Result<Option<T>>
@@ -658,6 +811,139 @@ mod tests {
             let result = tool_result(call_tool(&service, tool, &args).await.unwrap(), false);
             assert!(result["structuredContent"].is_object());
             assert!(result["structuredContent"][field].is_array());
+        }
+    }
+
+    #[tokio::test]
+    async fn exposes_existing_agent_workflows_through_mcp() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = call_tool(
+            &service,
+            "threadmark_create_effort",
+            &json!({
+                "slug": "parity",
+                "title": "MCP parity",
+                "destination": "Expose existing workflows",
+                "actor_id": "agent",
+            }),
+        )
+        .await
+        .unwrap();
+        let first = call_tool(
+            &service,
+            "threadmark_add_node",
+            &json!({
+                "effort": "parity",
+                "kind": "question",
+                "title": "First",
+                "actor_id": "agent",
+                "expected_version": 1,
+            }),
+        )
+        .await
+        .unwrap();
+        let second = call_tool(
+            &service,
+            "threadmark_add_node",
+            &json!({
+                "effort": "parity",
+                "kind": "question",
+                "title": "Second",
+                "actor_id": "agent",
+                "expected_version": 2,
+            }),
+        )
+        .await
+        .unwrap();
+        let fog = call_tool(
+            &service,
+            "threadmark_add_fog",
+            &json!({
+                "effort": "parity",
+                "title": "Unknown boundary",
+                "description": "Needs a concrete question",
+                "anchor": first["node"]["id"],
+                "actor_id": "agent",
+                "expected_version": 3,
+            }),
+        )
+        .await
+        .unwrap();
+        call_tool(
+            &service,
+            "threadmark_graduate_fog",
+            &json!({
+                "effort": "parity",
+                "fog": fog["fog"]["id"],
+                "to": [second["node"]["id"]],
+                "actor_id": "agent",
+                "expected_version": 4,
+            }),
+        )
+        .await
+        .unwrap();
+        call_tool(
+            &service,
+            "threadmark_propose_contradiction",
+            &json!({
+                "effort": "parity",
+                "left": first["node"]["id"],
+                "right": second["node"]["id"],
+                "detail": "The answers may conflict",
+                "actor_id": "agent",
+                "expected_version": 5,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = call_tool(
+            &service,
+            "threadmark_get_snapshot",
+            &json!({"effort": "parity"}),
+        )
+        .await
+        .unwrap();
+        let effort_history = call_tool(
+            &service,
+            "threadmark_get_history",
+            &json!({"effort": "parity"}),
+        )
+        .await
+        .unwrap();
+        let node_history = call_tool(
+            &service,
+            "threadmark_get_history",
+            &json!({"effort": "parity", "node": first["node"]["id"]}),
+        )
+        .await
+        .unwrap();
+        let handoff = call_tool(
+            &service,
+            "threadmark_render_handoff",
+            &json!({"effort": "parity"}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(effort["status"], "active");
+        assert_eq!(snapshot["graph"]["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(snapshot["graph"]["fog_patches"][0]["status"], "graduated");
+        assert_eq!(snapshot["graph"]["findings"].as_array().unwrap().len(), 1);
+        assert!(effort_history["events"].as_array().unwrap().len() >= 6);
+        assert_eq!(node_history["revisions"].as_array().unwrap().len(), 1);
+        assert!(handoff["handoff"].as_str().unwrap().contains("MCP parity"));
+        for name in [
+            "threadmark_create_effort",
+            "threadmark_get_snapshot",
+            "threadmark_get_history",
+            "threadmark_add_fog",
+            "threadmark_graduate_fog",
+            "threadmark_propose_contradiction",
+            "threadmark_render_handoff",
+        ] {
+            assert!(tool_definitions().iter().any(|tool| tool["name"] == name));
         }
     }
 

@@ -10,9 +10,10 @@ has decided, and still needs to resolve. Agents use its MCP tools exclusively.
 If the MCP is not exposed in the current session, stop and ask for a restart;
 do not fall back to the CLI or edit SQLite directly.
 
-Effort creation is deliberately an operator/bootstrap concern, not an agent
-workflow tool. Work only on an existing effort. An effort is complete only
-after readiness passes and `threadmark_complete_effort` succeeds.
+Workspace initialization is an operator/bootstrap concern. When no existing
+effort fits and the user explicitly authorizes a new effort, create it through
+`threadmark_create_effort`; never fall back to the CLI. An effort is complete
+only after readiness passes and `threadmark_complete_effort` succeeds.
 
 ## Workflow state machine
 
@@ -35,8 +36,8 @@ Orient
   -> Reconcile  when a premise, decision, or review finding is challenged
   -> Verify     when the frontier is empty or a handoff is requested
   -> Split      when readiness passes and the user approves ticket splitting
-  -> Stop       when the effort is completed, blocked on a human, or MCP lacks
-                the transition needed to preserve the graph
+  -> Stop       when the effort is completed with no new challenge, blocked on
+                a human, or MCP lacks the transition needed to preserve the graph
 ```
 
 ### Plan
@@ -99,9 +100,11 @@ CLI as a fallback.
 ### Reconcile
 
 Inspect the challenged premise, decision, or review-required descendant. Read
-[references/graph-semantics.md](references/graph-semantics.md), preview
-invalidation, and commit only the reviewed propagation. Then return to
-**Work** for reopened nodes or **Verify** when no work remains.
+[references/graph-semantics.md](references/graph-semantics.md). If the effort is
+completed, reactivate it first with `threadmark_reopen_effort`, recording the
+actor, reason, and expected effort version. Preview invalidation and commit only
+the reviewed propagation. Then return to **Work** for reopened nodes or
+**Verify** when no work remains.
 
 ### Verify
 
@@ -118,9 +121,9 @@ work itself, complete the effort through `threadmark_complete_effort` and stop.
 Turn the converged effort into a proposed implementation-ticket split. This is a
 handoff to the configured tracker, not a new Threadmark graph or an execution DAG.
 
-1. Load the resolved decisions, constraints, scope, and dependency order needed
-   for implementation. Use an MCP handoff tool when one is available; otherwise
-   fetch the relevant nodes through MCP.
+1. Load `threadmark_render_handoff`, then use the snapshot and history tools for
+   any resolved decisions, constraints, provenance, or dependency detail needed
+   for implementation.
 2. Search the tracker for existing work before proposing new tickets. Reuse or
    relate matching work instead of duplicating it.
 3. Split by independently implementable, reviewable outcomes in delivery order.

@@ -20,6 +20,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 threadmark-application = { path = "../threadmark-application" }
 threadmark-domain = { path = "../threadmark-domain" }
+threadmark-export = { path = "../threadmark-export" }
 
 [dev-dependencies]
 tempfile.workspace = true
