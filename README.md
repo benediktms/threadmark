@@ -53,7 +53,7 @@ threadmark node add architecture question \
   --impact high --uncertainty high --cost-of-wrong critical
 
 threadmark frontier architecture
-threadmark claim next architecture --actor codex --session session-1
+threadmark claim next architecture --actor codex
 threadmark status architecture
 ```
 

@@ -1,4 +1,4 @@
-use std::{path::PathBuf, str::FromStr};
+use std::{env, path::PathBuf, str::FromStr};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -129,8 +129,7 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
             service
                 .claim_next(
                     required(args, "effort")?,
-                    required(args, "actor_id")?,
-                    required(args, "session_id")?,
+                    &harness_claimant()?,
                     args.get("lease_minutes")
                         .and_then(Value::as_i64)
                         .unwrap_or(30),
@@ -142,8 +141,7 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                 .claim_node(
                     required(args, "effort")?,
                     required(args, "node")?,
-                    required(args, "actor_id")?,
-                    required(args, "session_id")?,
+                    &harness_claimant()?,
                     args.get("lease_minutes")
                         .and_then(Value::as_i64)
                         .unwrap_or(30),
@@ -155,7 +153,7 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                 .release_claim(
                     required(args, "effort")?,
                     required(args, "claim_id")?,
-                    required(args, "actor_id")?,
+                    &harness_claimant()?,
                     args.get("reason")
                         .and_then(Value::as_str)
                         .unwrap_or("released"),
@@ -163,6 +161,17 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                 .await?;
             Ok(json!({"released": true}))
         }
+        "threadmark_heartbeat_claim" => Ok(serde_json::to_value(
+            service
+                .heartbeat_claim(
+                    required(args, "claim_id")?,
+                    &harness_claimant()?,
+                    args.get("lease_minutes")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(30),
+                )
+                .await?,
+        )?),
         "threadmark_add_source" => {
             let (source, version) = service
                 .add_source(
@@ -274,11 +283,10 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
         "threadmark_resolve_node" => {
             let confidence = parse_optional::<Confidence>(args, "confidence")?;
             let (node, version) = service
-                .resolve_node(
+                .resolve_harness_node(
                     required(args, "effort")?,
                     required(args, "node")?,
-                    required(args, "actor_id")?,
-                    args.get("session_id").and_then(Value::as_str),
+                    &harness_claimant()?,
                     required(args, "body")?.into(),
                     args.get("payload").cloned(),
                     confidence,
@@ -392,8 +400,16 @@ fn tool_definitions() -> Vec<Value> {
             "threadmark_release_claim",
             "Release an active claim",
             object(
-                &["effort", "claim_id", "actor_id"],
-                json!({"effort":{"type":"string"},"claim_id":{"type":"string"},"actor_id":{"type":"string"},"reason":{"type":"string"}}),
+                &["effort", "claim_id"],
+                json!({"effort":{"type":"string"},"claim_id":{"type":"string"},"reason":{"type":"string"}}),
+            ),
+        ),
+        tool(
+            "threadmark_heartbeat_claim",
+            "Extend an active claim owned by this harness",
+            object(
+                &["claim_id"],
+                json!({"claim_id":{"type":"string"},"lease_minutes":{"type":"integer","minimum":1}}),
             ),
         ),
         tool(
@@ -440,8 +456,8 @@ fn tool_definitions() -> Vec<Value> {
             "threadmark_resolve_node",
             "Resolve a node and append an immutable revision",
             object(
-                &["effort", "node", "actor_id", "body"],
-                json!({"effort":{"type":"string"},"node":{"type":"string"},"actor_id":{"type":"string"},"session_id":{"type":"string"},"body":{"type":"string"},"payload":{},"confidence":{"type":"string"},"confidence_reason":{"type":"string"},"reason":{"type":"string"},"expected_version":{"type":"integer"}}),
+                &["effort", "node", "body"],
+                json!({"effort":{"type":"string"},"node":{"type":"string"},"body":{"type":"string"},"payload":{},"confidence":{"type":"string"},"confidence_reason":{"type":"string"},"reason":{"type":"string"},"expected_version":{"type":"integer"}}),
             ),
         ),
         tool(
@@ -480,8 +496,9 @@ fn object(required: &[&str], properties: Value) -> Value {
 }
 
 fn claim_schema(with_node: bool) -> Value {
-    let mut properties = json!({"effort":{"type":"string"},"actor_id":{"type":"string"},"session_id":{"type":"string"},"lease_minutes":{"type":"integer","minimum":1}});
-    let mut required_fields = vec!["effort", "actor_id", "session_id"];
+    let mut properties =
+        json!({"effort":{"type":"string"},"lease_minutes":{"type":"integer","minimum":1}});
+    let mut required_fields = vec!["effort"];
     if with_node {
         properties
             .as_object_mut()
@@ -490,6 +507,34 @@ fn claim_schema(with_node: bool) -> Value {
         required_fields.push("node");
     }
     object(&required_fields, properties)
+}
+
+fn harness_claimant() -> Result<String> {
+    let codex = env::var("CODEX_THREAD_ID")
+        .ok()
+        .filter(|session| !session.is_empty());
+    let claude = env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .filter(|session| !session.is_empty());
+    harness_claimant_for(
+        codex.as_deref(),
+        env::var_os("CLAUDECODE").is_some(),
+        claude.as_deref(),
+    )
+}
+
+fn harness_claimant_for(
+    codex: Option<&str>,
+    claude_marker: bool,
+    claude_session: Option<&str>,
+) -> Result<String> {
+    match (codex, claude_marker, claude_session) {
+        (Some(session), false, _) => Ok(format!("openai-codex:{session}")),
+        (None, true, Some(session)) => Ok(format!("claude-code:{session}")),
+        _ => anyhow::bail!(
+            "Threadmark MCP requires CODEX_THREAD_ID or CLAUDECODE with CLAUDE_CODE_SESSION_ID"
+        ),
+    }
 }
 
 fn required<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -527,4 +572,37 @@ async fn write_message(stdout: &mut tokio::io::Stdout, value: &Value) -> Result<
     stdout.write_all(b"\n").await?;
     stdout.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claim_tools_do_not_accept_caller_identity() {
+        let schema = claim_schema(true);
+        let properties = schema["properties"].as_object().unwrap();
+        assert!(!properties.contains_key("actor_id"));
+        assert!(!properties.contains_key("session_id"));
+        assert_eq!(schema["required"], json!(["effort", "node"]));
+    }
+
+    #[test]
+    fn maps_each_harness_session_to_a_distinct_claimant() {
+        assert_eq!(
+            harness_claimant_for(Some("codex-a"), false, None).unwrap(),
+            "openai-codex:codex-a"
+        );
+        assert_eq!(
+            harness_claimant_for(None, true, Some("claude-a")).unwrap(),
+            "claude-code:claude-a"
+        );
+        assert_ne!(
+            harness_claimant_for(Some("codex-a"), false, None).unwrap(),
+            harness_claimant_for(Some("codex-b"), false, None).unwrap()
+        );
+        assert!(harness_claimant_for(None, false, None).is_err());
+        assert!(harness_claimant_for(Some("codex"), true, Some("claude")).is_err());
+        assert!(harness_claimant_for(None, true, None).is_err());
+    }
 }

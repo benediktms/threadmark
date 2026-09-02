@@ -35,6 +35,8 @@ pub enum StoreError {
     ActiveClaims,
     #[error("entity was not found")]
     NotFound,
+    #[error("claim is not actively owned by {0}")]
+    ClaimNotOwned(String),
     #[error("effort version conflict: expected {expected}, actual {actual}")]
     VersionConflict { expected: i64, actual: i64 },
 }
@@ -42,6 +44,13 @@ pub enum StoreError {
 #[derive(Clone, Debug)]
 pub struct Store {
     pool: SqlitePool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ClaimGuard<'a> {
+    None,
+    MustOwn(&'a str),
+    OwnIfClaimed(&'a str),
 }
 
 impl Store {
@@ -359,9 +368,24 @@ impl Store {
         revision: Option<&NodeRevision>,
         event: &AuditEvent,
         expected_version: i64,
+        claim_guard: ClaimGuard<'_>,
     ) -> Result<i64, StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         check_version(&mut tx, &node.effort_id, expected_version).await?;
+        if let ClaimGuard::MustOwn(claimant) | ClaimGuard::OwnIfClaimed(claimant) = claim_guard {
+            let owner: Option<String> = sqlx::query_scalar(
+                "SELECT claimant FROM claims WHERE node_id=? \
+                 AND released_at IS NULL AND julianday(lease_expires_at)>julianday('now')",
+            )
+            .bind(&node.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if owner.as_deref().is_some_and(|owner| owner != claimant)
+                || (owner.is_none() && matches!(claim_guard, ClaimGuard::MustOwn(_)))
+            {
+                return Err(StoreError::ClaimNotOwned(claimant.into()));
+            }
+        }
         sqlx::query("UPDATE nodes SET title=?,summary=?,lifecycle=?,validity=?,confidence=?,confidence_reason=?,reversibility=?,impact=?,uncertainty=?,cost_of_wrong=?,current_revision=?,updated_at=? WHERE id=?")
             .bind(&node.title).bind(&node.summary).bind(node.lifecycle.as_str()).bind(node.validity.as_str())
             .bind(node.confidence.map(Confidence::as_str)).bind(&node.confidence_reason)
@@ -401,8 +425,8 @@ impl Store {
         }
         sqlx::query("UPDATE claims SET released_at=?,release_reason='lease expired' WHERE node_id=? AND released_at IS NULL AND lease_expires_at<=?")
             .bind(now).bind(&claim.node_id).bind(now).execute(&mut *tx).await?;
-        let result = sqlx::query("INSERT INTO claims(id,node_id,actor_id,session_id,claimed_at,heartbeat_at,lease_expires_at) VALUES(?,?,?,?,?,?,?)")
-            .bind(&claim.id).bind(&claim.node_id).bind(&claim.actor_id).bind(&claim.session_id)
+        let result = sqlx::query("INSERT INTO claims(id,node_id,actor_id,claimant,claimed_at,heartbeat_at,lease_expires_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&claim.id).bind(&claim.node_id).bind(&claim.actor_id).bind(&claim.claimant)
             .bind(&claim.claimed_at).bind(&claim.heartbeat_at).bind(&claim.lease_expires_at)
             .execute(&mut *tx).await;
         if let Err(error) = result {
@@ -426,19 +450,54 @@ impl Store {
         Ok(())
     }
 
+    pub async fn reap_expired_claims(&self, effort_id: &str) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let timestamp: String = sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE nodes SET lifecycle='open',updated_at=? \
+             WHERE effort_id=? AND lifecycle='in_progress' \
+             AND id IN (SELECT node_id FROM claims \
+                        WHERE released_at IS NULL AND julianday(lease_expires_at)<=julianday(?))",
+        )
+        .bind(&timestamp)
+        .bind(effort_id)
+        .bind(&timestamp)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE claims SET released_at=?,release_reason='lease expired' \
+             WHERE released_at IS NULL AND julianday(lease_expires_at)<=julianday(?) \
+             AND node_id IN (SELECT id FROM nodes WHERE effort_id=?)",
+        )
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .bind(effort_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn release_claim(
         &self,
         claim_id: &str,
+        claimant: &str,
         now: &str,
         reason: &str,
         event: &AuditEvent,
     ) -> Result<(), StoreError> {
-        let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT node_id FROM claims WHERE id=? AND released_at IS NULL")
-            .bind(claim_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(StoreError::NotFound)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query(
+            "SELECT node_id FROM claims WHERE id=? AND claimant=? \
+             AND released_at IS NULL AND julianday(lease_expires_at)>julianday('now')",
+        )
+        .bind(claim_id)
+        .bind(claimant)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| StoreError::ClaimNotOwned(claimant.into()))?;
         let node_id: String = row.get("node_id");
         sqlx::query("UPDATE claims SET released_at=?,release_reason=? WHERE id=?")
             .bind(now)
@@ -461,26 +520,27 @@ impl Store {
     pub async fn heartbeat_claim(
         &self,
         claim_id: &str,
-        session_id: &str,
+        claimant: &str,
         heartbeat: &str,
         expires: &str,
     ) -> Result<Claim, StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query(
-            "UPDATE claims SET heartbeat_at=?,lease_expires_at=? \
-             WHERE id=? AND session_id=? AND released_at IS NULL AND lease_expires_at>? \
+            "UPDATE claims SET heartbeat_at=?,lease_expires_at=CASE \
+             WHEN julianday(lease_expires_at)>julianday(?) THEN lease_expires_at ELSE ? END \
+             WHERE id=? AND claimant=? AND released_at IS NULL AND julianday(lease_expires_at)>julianday('now') \
              AND EXISTS (SELECT 1 FROM nodes JOIN efforts ON efforts.id=nodes.effort_id \
                          WHERE nodes.id=claims.node_id AND efforts.status='active')",
         )
         .bind(heartbeat)
         .bind(expires)
+        .bind(expires)
         .bind(claim_id)
-        .bind(session_id)
-        .bind(heartbeat)
+        .bind(claimant)
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() != 1 {
-            return Err(StoreError::NotFound);
+            return Err(StoreError::ClaimNotOwned(claimant.into()));
         }
         let row = sqlx::query("SELECT * FROM claims WHERE id=?")
             .bind(claim_id)
@@ -885,7 +945,7 @@ fn row_to_claim(row: SqliteRow) -> Claim {
         id: row.get("id"),
         node_id: row.get("node_id"),
         actor_id: row.get("actor_id"),
-        session_id: row.get("session_id"),
+        claimant: row.get("claimant"),
         claimed_at: row.get("claimed_at"),
         heartbeat_at: row.get("heartbeat_at"),
         lease_expires_at: row.get("lease_expires_at"),
@@ -1078,5 +1138,108 @@ mod tests {
             store.get_node("effort", "node").await.unwrap().lifecycle,
             Lifecycle::Open
         );
+    }
+
+    #[tokio::test]
+    async fn reaping_an_expired_claim_reopens_its_node() {
+        let directory = TempDir::new().unwrap();
+        let store = Store::connect(&directory.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces(id,name,root_uri,schema_version,created_at,updated_at) VALUES('workspace','test','test',1,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO efforts(id,workspace_id,slug,title,destination,status,version,created_at,updated_at) VALUES('effort','workspace','test','test','test','active',1,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO nodes(id,effort_id,kind,title,lifecycle,validity,current_revision,created_at,updated_at) VALUES('node','effort','action','test','in_progress','current',0,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO node_revisions(node_id,revision,body,payload_json,actor_id,created_at) VALUES('node',0,'','{}','test','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO claims(id,node_id,actor_id,claimant,claimed_at,heartbeat_at,lease_expires_at) VALUES('claim','node','openai-codex','openai-codex','then','then','2020')")
+            .execute(&store.pool).await.unwrap();
+
+        store.reap_expired_claims("effort").await.unwrap();
+
+        assert_eq!(
+            store.get_node("effort", "node").await.unwrap().lifecycle,
+            Lifecycle::Open
+        );
+        let released_at: Option<String> =
+            sqlx::query_scalar("SELECT released_at FROM claims WHERE id='claim'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert!(released_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn reaping_does_not_reopen_an_unclaimed_node() {
+        let directory = TempDir::new().unwrap();
+        let store = Store::connect(&directory.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces(id,name,root_uri,schema_version,created_at,updated_at) VALUES('workspace','test','test',1,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO efforts(id,workspace_id,slug,title,destination,status,version,created_at,updated_at) VALUES('effort','workspace','test','test','test','active',1,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO nodes(id,effort_id,kind,title,lifecycle,validity,current_revision,created_at,updated_at) VALUES('node','effort','action','test','in_progress','current',0,'then','then')")
+            .execute(&store.pool).await.unwrap();
+
+        store.reap_expired_claims("effort").await.unwrap();
+
+        let row = sqlx::query("SELECT lifecycle,updated_at FROM nodes WHERE id='node'")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("lifecycle"), "in_progress");
+        assert_eq!(row.get::<String, _>("updated_at"), "then");
+    }
+
+    #[tokio::test]
+    async fn claimant_migration_retires_legacy_claims_and_reopens_their_nodes() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE nodes (id TEXT PRIMARY KEY, lifecycle TEXT NOT NULL, updated_at TEXT NOT NULL); \
+             CREATE TABLE claims (id TEXT PRIMARY KEY, node_id TEXT NOT NULL, session_id TEXT NOT NULL, lease_expires_at TEXT NOT NULL, released_at TEXT, release_reason TEXT); \
+             INSERT INTO nodes VALUES ('claimed','in_progress','then'),('unclaimed','in_progress','then'),('released','in_progress','then'); \
+             INSERT INTO claims VALUES ('active','claimed','session','future',NULL,NULL),('old','released','session','past','past','done');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(include_str!("../migrations/0002_claimant.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let nodes: Vec<(String, String)> =
+            sqlx::query_as("SELECT id,lifecycle FROM nodes ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            nodes,
+            vec![
+                ("claimed".into(), "open".into()),
+                ("released".into(), "in_progress".into()),
+                ("unclaimed".into(), "in_progress".into()),
+            ]
+        );
+        let active: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT released_at,release_reason FROM claims WHERE id='active'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(active.0.is_some());
+        assert_eq!(active.1.as_deref(), Some("claimant migration"));
+        let claimant: String = sqlx::query_scalar("SELECT claimant FROM claims WHERE id='active'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(claimant, "session");
     }
 }

@@ -281,7 +281,7 @@ pub struct Claim {
     pub id: Id,
     pub node_id: Id,
     pub actor_id: String,
-    pub session_id: String,
+    pub claimant: String,
     pub claimed_at: String,
     pub heartbeat_at: String,
     pub lease_expires_at: String,

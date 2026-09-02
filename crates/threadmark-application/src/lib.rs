@@ -18,7 +18,7 @@ use threadmark_domain::{
     ReadinessReport, RiskLevel, Source, SourceKind, SourceTrust, Validity, Workspace,
     calculate_frontier, evaluate_readiness, lint_graph, preview_invalidation, validate_edge,
 };
-use threadmark_store::{Store, StoreError};
+use threadmark_store::{ClaimGuard, Store, StoreError};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use ulid::Ulid;
 
@@ -375,7 +375,9 @@ impl Service {
     }
 
     pub async fn status(&self, effort: &str) -> Result<EffortStatusView, ApplicationError> {
-        let (effort, graph) = self.snapshot(effort).await?;
+        let effort = self.get_effort(effort).await?;
+        self.store.reap_expired_claims(&effort.id).await?;
+        let graph = self.store.snapshot(&effort.id).await?;
         let frontier = calculate_frontier(&graph, &now());
         let readiness = evaluate_readiness(&graph);
         let lint = lint_graph(&graph);
@@ -427,36 +429,30 @@ impl Service {
     pub async fn claim_next(
         &self,
         effort: &str,
-        actor_id: &str,
-        session_id: &str,
+        claimant: &str,
         lease_minutes: i64,
     ) -> Result<Claim, ApplicationError> {
         let effort = self.active_effort(effort).await?;
+        self.store.reap_expired_claims(&effort.id).await?;
         let graph = self.store.snapshot(&effort.id).await?;
         let timestamp = now();
         let frontier = calculate_frontier(&graph, &timestamp);
         let node = frontier
             .first()
             .ok_or_else(|| ApplicationError::NotOnFrontier("no ready nodes".into()))?;
-        self.claim_node(
-            &effort.slug,
-            &node.node.id,
-            actor_id,
-            session_id,
-            lease_minutes,
-        )
-        .await
+        self.claim_node(&effort.slug, &node.node.id, claimant, lease_minutes)
+            .await
     }
 
     pub async fn claim_node(
         &self,
         effort: &str,
         selector: &str,
-        actor_id: &str,
-        session_id: &str,
+        claimant: &str,
         lease_minutes: i64,
     ) -> Result<Claim, ApplicationError> {
         let effort = self.active_effort(effort).await?;
+        self.store.reap_expired_claims(&effort.id).await?;
         let graph = self.store.snapshot(&effort.id).await?;
         let timestamp = now();
         let frontier = calculate_frontier(&graph, &timestamp);
@@ -470,8 +466,8 @@ impl Service {
         let claim = Claim {
             id: id(),
             node_id: entry.node.id.clone(),
-            actor_id: actor_id.into(),
-            session_id: session_id.into(),
+            actor_id: claimant.into(),
+            claimant: claimant.into(),
             claimed_at: timestamp.clone(),
             heartbeat_at: timestamp.clone(),
             lease_expires_at: expires,
@@ -480,8 +476,8 @@ impl Service {
         };
         let audit = event(
             Some(&effort.id),
-            actor_id,
-            Some(session_id),
+            claimant,
+            None,
             "claim_acquired",
             "claim",
             &claim.id,
@@ -516,7 +512,7 @@ impl Service {
             &timestamp,
         );
         self.store
-            .release_claim(claim_id, &timestamp, reason, &audit)
+            .release_claim(claim_id, actor_id, &timestamp, reason, &audit)
             .await?;
         Ok(())
     }
@@ -524,7 +520,7 @@ impl Service {
     pub async fn heartbeat_claim(
         &self,
         claim_id: &str,
-        session_id: &str,
+        claimant: &str,
         lease_minutes: i64,
     ) -> Result<Claim, ApplicationError> {
         let heartbeat = now();
@@ -533,7 +529,7 @@ impl Service {
             .expect("RFC3339 formatting succeeds");
         Ok(self
             .store
-            .heartbeat_claim(claim_id, session_id, &heartbeat, &expires)
+            .heartbeat_claim(claim_id, claimant, &heartbeat, &expires)
             .await?)
     }
 
@@ -550,6 +546,105 @@ impl Service {
         confidence_reason: Option<String>,
         reason: &str,
         expected_version: Option<i64>,
+    ) -> Result<(Node, i64), ApplicationError> {
+        let node = self.get_node(effort, selector).await?;
+        self.resolve_node_inner(
+            effort,
+            selector,
+            actor_id,
+            session_id,
+            body,
+            payload,
+            confidence,
+            confidence_reason,
+            reason,
+            expected_version,
+            if node.claimable() {
+                ClaimGuard::OwnIfClaimed(actor_id)
+            } else {
+                ClaimGuard::None
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_claimed_node(
+        &self,
+        effort: &str,
+        selector: &str,
+        claimant: &str,
+        body: String,
+        payload: Option<Value>,
+        confidence: Option<Confidence>,
+        confidence_reason: Option<String>,
+        reason: &str,
+        expected_version: Option<i64>,
+    ) -> Result<(Node, i64), ApplicationError> {
+        self.resolve_node_inner(
+            effort,
+            selector,
+            claimant,
+            None,
+            body,
+            payload,
+            confidence,
+            confidence_reason,
+            reason,
+            expected_version,
+            ClaimGuard::MustOwn(claimant),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_harness_node(
+        &self,
+        effort: &str,
+        selector: &str,
+        claimant: &str,
+        body: String,
+        payload: Option<Value>,
+        confidence: Option<Confidence>,
+        confidence_reason: Option<String>,
+        reason: &str,
+        expected_version: Option<i64>,
+    ) -> Result<(Node, i64), ApplicationError> {
+        let node = self.get_node(effort, selector).await?;
+        self.resolve_node_inner(
+            effort,
+            selector,
+            claimant,
+            None,
+            body,
+            payload,
+            confidence,
+            confidence_reason,
+            reason,
+            expected_version,
+            if node.claimable() {
+                ClaimGuard::MustOwn(claimant)
+            } else {
+                ClaimGuard::None
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_node_inner(
+        &self,
+        effort: &str,
+        selector: &str,
+        actor_id: &str,
+        session_id: Option<&str>,
+        body: String,
+        payload: Option<Value>,
+        confidence: Option<Confidence>,
+        confidence_reason: Option<String>,
+        reason: &str,
+        expected_version: Option<i64>,
+        claim_guard: ClaimGuard<'_>,
     ) -> Result<(Node, i64), ApplicationError> {
         let effort = self.active_effort(effort).await?;
         let expected = expected_version.unwrap_or(effort.version);
@@ -581,7 +676,7 @@ impl Service {
         );
         let version = self
             .store
-            .update_node(&node, Some(&revision), &audit, expected)
+            .update_node(&node, Some(&revision), &audit, expected, claim_guard)
             .await?;
         Ok((node, version))
     }
@@ -622,7 +717,7 @@ impl Service {
         );
         let version = self
             .store
-            .update_node(&node, Some(&revision), &audit, expected)
+            .update_node(&node, Some(&revision), &audit, expected, ClaimGuard::None)
             .await?;
         Ok((node, version))
     }
@@ -1363,7 +1458,7 @@ mod tests {
             .await
             .unwrap();
         service
-            .claim_node(&effort.slug, &node.id, "test", "test", 30)
+            .claim_node(&effort.slug, &node.id, "test", 30)
             .await
             .unwrap();
 
@@ -1371,6 +1466,187 @@ mod tests {
             service.complete_effort(&effort.slug, "test", None).await,
             Err(ApplicationError::Store(StoreError::ActiveClaims))
         ));
+    }
+
+    #[tokio::test]
+    async fn resolves_an_unclaimed_in_progress_node() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = service
+            .create_effort(CreateEffort {
+                slug: "in-progress".into(),
+                title: "In progress".into(),
+                destination: "Finish".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        let (node, _) = service
+            .add_node(AddNode {
+                effort: effort.slug.clone(),
+                node: NewNode {
+                    kind: NodeKind::Action,
+                    title: "Already in progress".into(),
+                    summary: String::new(),
+                    body: String::new(),
+                    payload: json!({}),
+                    lifecycle: Lifecycle::InProgress,
+                    confidence: None,
+                    confidence_reason: None,
+                    reversibility: None,
+                    impact: None,
+                    uncertainty: None,
+                    cost_of_wrong: None,
+                },
+                actor_id: "test".into(),
+                session_id: None,
+                expected_version: None,
+            })
+            .await
+            .unwrap();
+
+        let (resolved, _) = service
+            .resolve_node(
+                &effort.slug,
+                &node.id,
+                "test",
+                None,
+                "done".into(),
+                None,
+                None,
+                None,
+                "done",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.lifecycle, Lifecycle::Resolved);
+    }
+
+    #[tokio::test]
+    async fn claim_mutations_require_the_active_harness_claimant() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = service
+            .create_effort(CreateEffort {
+                slug: "claim-owner".into(),
+                title: "Claim owner".into(),
+                destination: "Test claim ownership".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        let node = add_test_node(&service, &effort.slug, NodeKind::Action, "owned").await;
+        let claim = service
+            .claim_node(&effort.slug, &node.id, "openai-codex", 120)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            service
+                .release_claim(&effort.slug, &claim.id, "claude-code", "released")
+                .await,
+            Err(ApplicationError::Store(StoreError::ClaimNotOwned(_)))
+        ));
+        assert!(matches!(
+            service.heartbeat_claim(&claim.id, "claude-code", 30).await,
+            Err(ApplicationError::Store(StoreError::ClaimNotOwned(_)))
+        ));
+        assert!(matches!(
+            service
+                .resolve_node(
+                    &effort.slug,
+                    &node.id,
+                    "claude-code",
+                    None,
+                    "resolved".into(),
+                    None,
+                    None,
+                    None,
+                    "resolved",
+                    None,
+                )
+                .await,
+            Err(ApplicationError::Store(StoreError::ClaimNotOwned(_)))
+        ));
+        let heartbeat = service
+            .heartbeat_claim(&claim.id, "openai-codex", 30)
+            .await
+            .unwrap();
+        assert_eq!(heartbeat.lease_expires_at, claim.lease_expires_at);
+        assert!(matches!(
+            service
+                .resolve_claimed_node(
+                    &effort.slug,
+                    &node.id,
+                    "claude-code",
+                    "resolved".into(),
+                    None,
+                    None,
+                    None,
+                    "resolved",
+                    None,
+                )
+                .await,
+            Err(ApplicationError::Store(StoreError::ClaimNotOwned(_)))
+        ));
+
+        service
+            .resolve_claimed_node(
+                &effort.slug,
+                &node.id,
+                "openai-codex",
+                "resolved".into(),
+                None,
+                None,
+                None,
+                "resolved",
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_claimable_nodes_resolve_without_a_claim() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = service
+            .create_effort(CreateEffort {
+                slug: "evidence".into(),
+                title: "Evidence".into(),
+                destination: "Test evidence resolution".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        let evidence = add_test_node(&service, &effort.slug, NodeKind::Evidence, "evidence").await;
+
+        service
+            .resolve_harness_node(
+                &effort.slug,
+                &evidence.id,
+                "openai-codex",
+                "recorded".into(),
+                None,
+                None,
+                None,
+                "recorded",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .get_node(&effort.slug, &evidence.id)
+                .await
+                .unwrap()
+                .lifecycle,
+            Lifecycle::Resolved
+        );
     }
 
     #[tokio::test]
@@ -1444,6 +1720,12 @@ mod tests {
                 .unwrap();
         }
         for node in [&assumption, &direct, &required, &question] {
+            if node.claimable() {
+                service
+                    .claim_node(&effort.slug, &node.id, "test", 30)
+                    .await
+                    .unwrap();
+            }
             service
                 .resolve_node(
                     &effort.slug,
