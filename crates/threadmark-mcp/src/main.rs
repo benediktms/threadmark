@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Parser)]
 #[command(name = "threadmark-mcp", version)]
 struct Args {
-    #[arg(long, default_value = ".")]
+    #[arg(long)]
     workspace: PathBuf,
 }
 
@@ -579,6 +579,36 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use threadmark_application::CreateEffort;
+
+    #[tokio::test]
+    async fn explicit_workspace_opens_a_nested_initialized_project() {
+        let repository = TempDir::new().unwrap();
+        let initialized = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+        assert!(initialized.success());
+        let project = repository.path().join("project");
+        Service::init(&project, "project").await.unwrap();
+
+        assert!(matches!(
+            Service::open(repository.path()).await,
+            Err(threadmark_application::ApplicationError::NotInitialized(_))
+        ));
+        let args =
+            Args::try_parse_from(["threadmark-mcp", "--workspace", project.to_str().unwrap()])
+                .unwrap();
+        assert_eq!(
+            Service::open(&args.workspace).await.unwrap().root(),
+            project.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn requires_an_explicit_workspace() {
+        assert!(Args::try_parse_from(["threadmark-mcp"]).is_err());
+    }
 
     #[tokio::test]
     async fn collection_tools_return_object_structured_content() {
