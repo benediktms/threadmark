@@ -444,22 +444,27 @@ impl Store {
 
     pub async fn reap_expired_claims(&self, effort_id: &str, now: &str) -> Result<(), StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let expiry: f64 = sqlx::query_scalar("SELECT julianday('now')")
+            .fetch_one(&mut *tx)
+            .await?;
         sqlx::query(
             "UPDATE nodes SET lifecycle='open',updated_at=? \
              WHERE effort_id=? AND lifecycle='in_progress' \
              AND id IN (SELECT node_id FROM claims \
-                        WHERE released_at IS NULL AND julianday(lease_expires_at)<=julianday('now'))",
+                        WHERE released_at IS NULL AND julianday(lease_expires_at)<=?)",
         )
         .bind(now)
         .bind(effort_id)
+        .bind(expiry)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
             "UPDATE claims SET released_at=?,release_reason='lease expired' \
-             WHERE released_at IS NULL AND julianday(lease_expires_at)<=julianday('now') \
+             WHERE released_at IS NULL AND julianday(lease_expires_at)<=? \
              AND node_id IN (SELECT id FROM nodes WHERE effort_id=?)",
         )
         .bind(now)
+        .bind(expiry)
         .bind(effort_id)
         .execute(&mut *tx)
         .await?;

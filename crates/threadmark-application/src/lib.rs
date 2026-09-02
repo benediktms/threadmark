@@ -547,6 +547,7 @@ impl Service {
         reason: &str,
         expected_version: Option<i64>,
     ) -> Result<(Node, i64), ApplicationError> {
+        let node = self.get_node(effort, selector).await?;
         self.resolve_node_inner(
             effort,
             selector,
@@ -558,7 +559,7 @@ impl Service {
             confidence_reason,
             reason,
             expected_version,
-            None,
+            node.claimable().then_some(actor_id),
         )
         .await
     }
@@ -1489,6 +1490,23 @@ mod tests {
             service.heartbeat_claim(&claim.id, "claude-code", 30).await,
             Err(ApplicationError::Store(StoreError::ClaimNotOwned(_)))
         ));
+        assert!(matches!(
+            service
+                .resolve_node(
+                    &effort.slug,
+                    &node.id,
+                    "claude-code",
+                    None,
+                    "resolved".into(),
+                    None,
+                    None,
+                    None,
+                    "resolved",
+                    None,
+                )
+                .await,
+            Err(ApplicationError::Store(StoreError::ClaimNotOwned(_)))
+        ));
         service
             .heartbeat_claim(&claim.id, "openai-codex", 30)
             .await
@@ -1637,6 +1655,12 @@ mod tests {
                 .unwrap();
         }
         for node in [&assumption, &direct, &required, &question] {
+            if node.claimable() {
+                service
+                    .claim_node(&effort.slug, &node.id, "test", 30)
+                    .await
+                    .unwrap();
+            }
             service
                 .resolve_node(
                     &effort.slug,
