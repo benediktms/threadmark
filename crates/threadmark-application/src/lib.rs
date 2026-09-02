@@ -653,6 +653,7 @@ impl Service {
         let expected = expected_version.unwrap_or(effort.version);
         let node = self.store.get_node(&effort.id, selector).await?;
         let preview = preview_invalidation(&graph, &node.id, target);
+        let root_node_id = node.id.clone();
         let timestamp = now();
         let nodes: HashMap<_, _> = graph
             .nodes
@@ -668,7 +669,12 @@ impl Service {
                 continue;
             }
             node.validity = change.to;
-            changed.insert(node.id.clone(), (node, change.reason.clone()));
+            let revision_reason = if node.id == root_node_id {
+                reason.to_owned()
+            } else {
+                change.reason.clone()
+            };
+            changed.insert(node.id.clone(), (node, revision_reason));
         }
         for question in &preview.reopened_questions {
             if !changed.contains_key(question) {
@@ -1483,6 +1489,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(version, current.version + 1);
+        assert_eq!(
+            service
+                .node_history(&effort.slug, &assumption.id)
+                .await
+                .unwrap()
+                .last()
+                .unwrap()
+                .reason
+                .as_deref(),
+            Some("premise disproven")
+        );
 
         assert_eq!(
             service
