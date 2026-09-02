@@ -1143,6 +1143,11 @@ mod tests {
             .canonicalize()
             .unwrap();
 
-        assert_eq!(init_workspace(&crate_dir.join("src")), expected);
+        assert_eq!(
+            init_workspace(&crate_dir.join("src"))
+                .canonicalize()
+                .unwrap(),
+            expected
+        );
     }
 }

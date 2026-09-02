@@ -1112,7 +1112,7 @@ Required rules include:
 
 ## 27. Audit and event history
 
-Every mutation emits an event in the same transaction. Events record explicit project artifacts and changes, not private chain-of-thought.
+Every project-state mutation emits an event in the same transaction. Lease heartbeats are operational liveness bookkeeping: they update claim lease state transactionally without emitting audit events. Events record explicit project artifacts and changes, not private chain-of-thought.
 
 Required event types include:
 
@@ -1120,7 +1120,7 @@ Required event types include:
 - node created/revised/resolved/reopened;
 - edge created/removed;
 - source attached/detached;
-- claim acquired/heartbeat/released/expired;
+- claim acquired/released/expired;
 - fog created/graduated/out-of-scope;
 - finding proposed/accepted/rejected/resolved;
 - invalidation previewed/committed;
@@ -1341,7 +1341,7 @@ Threadmark v1 is complete when:
 3. A 10,000-node synthetic fixture meets the performance targets or documented deviations are accepted.
 4. Concurrent claims have a deterministic one-winner test.
 5. Invalidation preview and commit are version-bound and auditable.
-6. Every mutation has an event and no event contains hidden model reasoning.
+6. Every project-state mutation has an event and no event contains hidden model reasoning.
 7. Export/import round trips are semantically identical.
 8. The shipped skill completes the acceptance scenario with at least two supported agent hosts.
 9. Documentation explains edge direction, lifecycle versus validity, and the deterministic/model boundary.
