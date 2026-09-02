@@ -3,7 +3,7 @@ use std::{env, path::PathBuf, str::FromStr};
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{Value, json};
-use threadmark_application::{AddEdge, AddNode, Service};
+use threadmark_application::{AddEdge, AddNode, ReopenEffort, Service};
 use threadmark_domain::{
     Confidence, EdgeType, Lifecycle, NewEdge, NewNode, NodeKind, SourceKind, SourceTrust, Validity,
 };
@@ -102,6 +102,16 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                     required(args, "actor_id")?,
                     args.get("expected_version").and_then(Value::as_i64),
                 )
+                .await?,
+        )?),
+        "threadmark_reopen_effort" => Ok(serde_json::to_value(
+            service
+                .reopen_effort(ReopenEffort {
+                    effort: required(args, "effort")?.into(),
+                    actor_id: required(args, "actor_id")?.into(),
+                    reason: required(args, "reason")?.into(),
+                    expected_version: args.get("expected_version").and_then(Value::as_i64),
+                })
                 .await?,
         )?),
         "threadmark_get_context" => {
@@ -356,6 +366,14 @@ fn tool_definitions() -> Vec<Value> {
             object(
                 &["effort", "actor_id"],
                 json!({"effort":{"type":"string"},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
+            ),
+        ),
+        tool(
+            "threadmark_reopen_effort",
+            "Reactivate a completed effort for reconciliation",
+            object(
+                &["effort", "actor_id", "reason"],
+                json!({"effort":{"type":"string"},"actor_id":{"type":"string"},"reason":{"type":"string","minLength":1},"expected_version":{"type":"integer"}}),
             ),
         ),
         tool(
@@ -641,6 +659,46 @@ mod tests {
             assert!(result["structuredContent"].is_object());
             assert!(result["structuredContent"][field].is_array());
         }
+    }
+
+    #[tokio::test]
+    async fn reopens_a_completed_effort_through_mcp() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = service
+            .create_effort(CreateEffort {
+                slug: "reopen".into(),
+                title: "Reopen".into(),
+                destination: "Reconcile later evidence".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        let completed = service
+            .complete_effort(&effort.slug, "test", Some(effort.version))
+            .await
+            .unwrap();
+
+        let reopened = call_tool(
+            &service,
+            "threadmark_reopen_effort",
+            &json!({
+                "effort": effort.slug,
+                "actor_id": "reviewer",
+                "reason": "new evidence",
+                "expected_version": completed.version,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reopened["status"], "active");
+        assert!(
+            tool_definitions()
+                .iter()
+                .any(|tool| tool["name"] == "threadmark_reopen_effort")
+        );
     }
 
     #[test]

@@ -47,6 +47,12 @@ pub enum ApplicationError {
     EffortNotReady(String),
     #[error("effort is not active: {0}")]
     EffortNotActive(EffortStatus),
+    #[error("effort is already active; reconcile it without reopening")]
+    EffortAlreadyActive,
+    #[error("effort cannot be reopened from status {0}; only completed efforts can be reopened")]
+    EffortNotCompleted(EffortStatus),
+    #[error("effort reopen reason cannot be empty")]
+    ReopenReasonRequired,
     #[error("expected version {expected}, but effort is at version {actual}")]
     VersionConflict { expected: i64, actual: i64 },
 }
@@ -75,6 +81,14 @@ pub struct CreateEffort {
     pub destination: String,
     pub scope_notes: String,
     pub actor_id: String,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct ReopenEffort {
+    pub effort: String,
+    pub actor_id: String,
+    pub reason: String,
+    pub expected_version: Option<i64>,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
@@ -264,6 +278,38 @@ impl Service {
             .store
             .complete_effort(&effort, &event, expected)
             .await?;
+        Ok(effort)
+    }
+
+    pub async fn reopen_effort(&self, input: ReopenEffort) -> Result<Effort, ApplicationError> {
+        if input.reason.trim().is_empty() {
+            return Err(ApplicationError::ReopenReasonRequired);
+        }
+        let previous = self.get_effort(&input.effort).await?;
+        match previous.status {
+            EffortStatus::Completed => {}
+            EffortStatus::Active => return Err(ApplicationError::EffortAlreadyActive),
+            status => return Err(ApplicationError::EffortNotCompleted(status)),
+        }
+        let expected = input.expected_version.unwrap_or(previous.version);
+        let timestamp = now();
+        let mut effort = previous.clone();
+        effort.status = EffortStatus::Active;
+        effort.version += 1;
+        effort.updated_at = timestamp.clone();
+        let event = event(
+            Some(&effort.id),
+            &input.actor_id,
+            None,
+            "effort_reopened",
+            "effort",
+            &effort.id,
+            Some(serde_json::to_value(&previous)?),
+            Some(serde_json::to_value(&effort)?),
+            Some(input.reason),
+            &timestamp,
+        );
+        effort.version = self.store.reopen_effort(&effort, &event, expected).await?;
         Ok(effort)
     }
 
@@ -1499,7 +1545,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completes_a_ready_effort_and_records_an_event() {
+    async fn completes_and_reopens_an_effort_without_losing_history() {
         let directory = TempDir::new().unwrap();
         let service = Service::init(directory.path(), "test").await.unwrap();
         let effort = service
@@ -1512,13 +1558,60 @@ mod tests {
             })
             .await
             .unwrap();
+        let (node, version) = service
+            .add_node(AddNode {
+                effort: effort.slug.clone(),
+                node: NewNode {
+                    kind: NodeKind::Action,
+                    title: "Resolved work".into(),
+                    summary: String::new(),
+                    body: "preserved".into(),
+                    payload: json!({}),
+                    lifecycle: Lifecycle::Resolved,
+                    confidence: None,
+                    confidence_reason: None,
+                    reversibility: None,
+                    impact: None,
+                    uncertainty: None,
+                    cost_of_wrong: None,
+                },
+                actor_id: "test".into(),
+                session_id: None,
+                expected_version: Some(effort.version),
+            })
+            .await
+            .unwrap();
+        let (source, version) = service
+            .add_source(
+                &effort.slug,
+                SourceKind::Issue,
+                "Issue".into(),
+                Some("https://example.com/issue".into()),
+                None,
+                SourceTrust::Authoritative,
+                "test",
+                Some(version),
+            )
+            .await
+            .unwrap();
+        let version = service
+            .attach_source(
+                &effort.slug,
+                &node.id,
+                &source.id,
+                "defines",
+                "test",
+                Some(version),
+            )
+            .await
+            .unwrap();
 
         let completed = service
-            .complete_effort(&effort.slug, "test", Some(effort.version))
+            .complete_effort(&effort.slug, "test", Some(version))
             .await
             .unwrap();
         assert_eq!(completed.status, EffortStatus::Completed);
-        assert_eq!(completed.version, effort.version + 1);
+        assert_eq!(completed.version, version + 1);
         assert!(
             service
                 .effort_history(&effort.slug)
@@ -1530,7 +1623,7 @@ mod tests {
         assert!(matches!(
             service
                 .add_node(AddNode {
-                    effort: effort.slug,
+                    effort: effort.slug.clone(),
                     node: NewNode {
                         kind: NodeKind::Question,
                         title: "Late question".into(),
@@ -1552,6 +1645,75 @@ mod tests {
                 .await,
             Err(ApplicationError::EffortNotActive(EffortStatus::Completed))
         ));
+
+        assert!(matches!(
+            service
+                .reopen_effort(ReopenEffort {
+                    effort: effort.slug.clone(),
+                    actor_id: "reviewer".into(),
+                    reason: "new evidence".into(),
+                    expected_version: Some(version),
+                })
+                .await,
+            Err(ApplicationError::Store(StoreError::VersionConflict { .. }))
+        ));
+        let reopened = service
+            .reopen_effort(ReopenEffort {
+                effort: effort.slug.clone(),
+                actor_id: "reviewer".into(),
+                reason: "new evidence".into(),
+                expected_version: Some(completed.version),
+            })
+            .await
+            .unwrap();
+        assert_eq!(reopened.status, EffortStatus::Active);
+        assert_eq!(reopened.version, completed.version + 1);
+        assert!(matches!(
+            service
+                .reopen_effort(ReopenEffort {
+                    effort: effort.slug.clone(),
+                    actor_id: "reviewer".into(),
+                    reason: "again".into(),
+                    expected_version: Some(reopened.version),
+                })
+                .await,
+            Err(ApplicationError::EffortAlreadyActive)
+        ));
+
+        let (_, snapshot, sources, events) = service.export_snapshot(&effort.slug).await.unwrap();
+        assert_eq!(snapshot.nodes, vec![node.clone()]);
+        assert_eq!(sources, vec![source]);
+        assert!(events.iter().any(|event| {
+            event.event_type == "effort_reopened"
+                && event.actor_id == "reviewer"
+                && event.reason.as_deref() == Some("new evidence")
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "effort_completed")
+        );
+
+        let (reopened_node, _) = service
+            .reopen_node(
+                &effort.slug,
+                &node.id,
+                "reviewer",
+                "reconcile",
+                Some(reopened.version),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reopened_node.lifecycle, Lifecycle::Open);
+        assert_eq!(
+            service
+                .node_history(&effort.slug, &node.id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(!service.status(&effort.slug).await.unwrap().readiness.ready);
     }
 
     #[tokio::test]

@@ -918,7 +918,7 @@ All mutation DTOs include `actor_id`; multi-step agent mutations also include `s
 
 ```text
 threadmark init
-threadmark effort create|list|show|update|complete|abandon
+threadmark effort create|list|show|update|complete|reopen|abandon
 threadmark context [effort]
 threadmark status [effort]
 threadmark frontier [effort] [--strategy risk|fifo]
@@ -994,6 +994,7 @@ The MCP server runs over stdio in v1. Tool names use the `threadmark_` prefix.
 ### 23.3 Mutation tools
 
 - `threadmark_apply_batch`
+- `threadmark_reopen_effort`
 - `threadmark_resolve_node`
 - `threadmark_reopen_node`
 - `threadmark_propose_contradiction`
