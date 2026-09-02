@@ -129,7 +129,7 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
             service
                 .claim_next(
                     required(args, "effort")?,
-                    harness_claimant()?,
+                    &harness_claimant()?,
                     args.get("lease_minutes")
                         .and_then(Value::as_i64)
                         .unwrap_or(30),
@@ -141,7 +141,7 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                 .claim_node(
                     required(args, "effort")?,
                     required(args, "node")?,
-                    harness_claimant()?,
+                    &harness_claimant()?,
                     args.get("lease_minutes")
                         .and_then(Value::as_i64)
                         .unwrap_or(30),
@@ -153,7 +153,7 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                 .release_claim(
                     required(args, "effort")?,
                     required(args, "claim_id")?,
-                    harness_claimant()?,
+                    &harness_claimant()?,
                     args.get("reason")
                         .and_then(Value::as_str)
                         .unwrap_or("released"),
@@ -165,7 +165,7 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
             service
                 .heartbeat_claim(
                     required(args, "claim_id")?,
-                    harness_claimant()?,
+                    &harness_claimant()?,
                     args.get("lease_minutes")
                         .and_then(Value::as_i64)
                         .unwrap_or(30),
@@ -286,7 +286,7 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                 .resolve_harness_node(
                     required(args, "effort")?,
                     required(args, "node")?,
-                    harness_claimant()?,
+                    &harness_claimant()?,
                     required(args, "body")?.into(),
                     args.get("payload").cloned(),
                     confidence,
@@ -509,18 +509,31 @@ fn claim_schema(with_node: bool) -> Value {
     object(&required_fields, properties)
 }
 
-fn harness_claimant() -> Result<&'static str> {
+fn harness_claimant() -> Result<String> {
+    let codex = env::var("CODEX_THREAD_ID")
+        .ok()
+        .filter(|session| !session.is_empty());
+    let claude = env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .filter(|session| !session.is_empty());
     harness_claimant_for(
-        env::var_os("CODEX_THREAD_ID").is_some(),
+        codex.as_deref(),
         env::var_os("CLAUDECODE").is_some(),
+        claude.as_deref(),
     )
 }
 
-fn harness_claimant_for(codex: bool, claude: bool) -> Result<&'static str> {
-    match (codex, claude) {
-        (true, false) => Ok("openai-codex"),
-        (false, true) => Ok("claude-code"),
-        _ => anyhow::bail!("Threadmark MCP requires exactly one of CODEX_THREAD_ID or CLAUDECODE"),
+fn harness_claimant_for(
+    codex: Option<&str>,
+    claude_marker: bool,
+    claude_session: Option<&str>,
+) -> Result<String> {
+    match (codex, claude_marker, claude_session) {
+        (Some(session), false, _) => Ok(format!("openai-codex:{session}")),
+        (None, true, Some(session)) => Ok(format!("claude-code:{session}")),
+        _ => anyhow::bail!(
+            "Threadmark MCP requires CODEX_THREAD_ID or CLAUDECODE with CLAUDE_CODE_SESSION_ID"
+        ),
     }
 }
 
@@ -575,10 +588,21 @@ mod tests {
     }
 
     #[test]
-    fn maps_each_supported_harness_to_its_claimant() {
-        assert_eq!(harness_claimant_for(true, false).unwrap(), "openai-codex");
-        assert_eq!(harness_claimant_for(false, true).unwrap(), "claude-code");
-        assert!(harness_claimant_for(false, false).is_err());
-        assert!(harness_claimant_for(true, true).is_err());
+    fn maps_each_harness_session_to_a_distinct_claimant() {
+        assert_eq!(
+            harness_claimant_for(Some("codex-a"), false, None).unwrap(),
+            "openai-codex:codex-a"
+        );
+        assert_eq!(
+            harness_claimant_for(None, true, Some("claude-a")).unwrap(),
+            "claude-code:claude-a"
+        );
+        assert_ne!(
+            harness_claimant_for(Some("codex-a"), false, None).unwrap(),
+            harness_claimant_for(Some("codex-b"), false, None).unwrap()
+        );
+        assert!(harness_claimant_for(None, false, None).is_err());
+        assert!(harness_claimant_for(Some("codex"), true, Some("claude")).is_err());
+        assert!(harness_claimant_for(None, true, None).is_err());
     }
 }
