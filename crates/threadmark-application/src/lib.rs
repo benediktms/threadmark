@@ -1,6 +1,7 @@
 //! Transactional application workflows shared by the CLI and MCP adapters.
 
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -653,6 +654,54 @@ impl Service {
         let node = self.store.get_node(&effort.id, selector).await?;
         let preview = preview_invalidation(&graph, &node.id, target);
         let timestamp = now();
+        let nodes: HashMap<_, _> = graph
+            .nodes
+            .into_iter()
+            .map(|node| (node.id.clone(), node))
+            .collect();
+        let mut changed = HashMap::new();
+        for change in &preview.changes {
+            let Some(mut node) = nodes.get(&change.node_id).cloned() else {
+                continue;
+            };
+            if node.validity == change.to {
+                continue;
+            }
+            node.validity = change.to;
+            changed.insert(node.id.clone(), (node, change.reason.clone()));
+        }
+        for question in &preview.reopened_questions {
+            if !changed.contains_key(question) {
+                let Some(node) = nodes.get(question).cloned() else {
+                    continue;
+                };
+                changed.insert(
+                    question.clone(),
+                    (node, "all resolvers became unusable".into()),
+                );
+            }
+            let Some((node, _)) = changed.get_mut(question) else {
+                continue;
+            };
+            if node.lifecycle == Lifecycle::Open && node.validity == Validity::ReviewRequired {
+                continue;
+            }
+            node.lifecycle = Lifecycle::Open;
+            node.validity = Validity::ReviewRequired;
+        }
+        let updates = changed
+            .into_values()
+            .filter_map(|(mut node, reason)| {
+                let original = nodes.get(&node.id)?;
+                if node.lifecycle == original.lifecycle && node.validity == original.validity {
+                    return None;
+                }
+                node.current_revision += 1;
+                node.updated_at = timestamp.clone();
+                let revision = revision(&node, actor_id, None, &reason, &timestamp);
+                Some((node, revision))
+            })
+            .collect::<Vec<_>>();
         let audit = event(
             Some(&effort.id),
             actor_id,
@@ -667,7 +716,7 @@ impl Service {
         );
         let version = self
             .store
-            .apply_invalidation(&effort.id, &preview, &audit, expected, &timestamp)
+            .apply_invalidation(&effort.id, &updates, &audit, expected, &timestamp)
             .await?;
         Ok((preview, version))
     }
@@ -1079,9 +1128,36 @@ fn database_path(root: &Path) -> PathBuf {
 mod tests {
     use serde_json::json;
     use tempfile::TempDir;
-    use threadmark_domain::{NodeKind, RiskLevel, Uncertainty};
+    use threadmark_domain::{EdgeType, NodeKind, RiskLevel, Uncertainty};
 
     use super::*;
+
+    async fn add_test_node(service: &Service, effort: &str, kind: NodeKind, title: &str) -> Node {
+        service
+            .add_node(AddNode {
+                effort: effort.into(),
+                node: NewNode {
+                    kind,
+                    title: title.into(),
+                    summary: String::new(),
+                    body: String::new(),
+                    payload: json!({}),
+                    lifecycle: Lifecycle::Open,
+                    confidence: None,
+                    confidence_reason: None,
+                    reversibility: None,
+                    impact: None,
+                    uncertainty: None,
+                    cost_of_wrong: None,
+                },
+                actor_id: "test".into(),
+                session_id: None,
+                expected_version: None,
+            })
+            .await
+            .unwrap()
+            .0
+    }
 
     #[tokio::test]
     async fn creates_effort_and_frontier_node() {
@@ -1310,6 +1386,149 @@ mod tests {
             Service::open(directory.path()).await,
             Err(ApplicationError::InvalidMarker(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn invalidation_preserves_revisions_and_only_reviews_resolved_requirements() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = service
+            .create_effort(CreateEffort {
+                slug: "invalidation".into(),
+                title: "Invalidation".into(),
+                destination: "Test invalidation".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        let assumption =
+            add_test_node(&service, &effort.slug, NodeKind::Assumption, "premise").await;
+        let direct = add_test_node(&service, &effort.slug, NodeKind::Action, "direct").await;
+        let required = add_test_node(&service, &effort.slug, NodeKind::Action, "required").await;
+        let question = add_test_node(&service, &effort.slug, NodeKind::Question, "question").await;
+        let open = add_test_node(&service, &effort.slug, NodeKind::Action, "open").await;
+
+        for (source, edge_type, target) in [
+            (&direct, EdgeType::Assumes, &assumption),
+            (&required, EdgeType::Requires, &direct),
+            (&open, EdgeType::Requires, &direct),
+            (&direct, EdgeType::Resolves, &question),
+        ] {
+            service
+                .add_edge(AddEdge {
+                    effort: effort.slug.clone(),
+                    edge: NewEdge {
+                        source_node_id: source.id.clone(),
+                        edge_type,
+                        target_node_id: target.id.clone(),
+                        rationale: None,
+                    },
+                    actor_id: "test".into(),
+                    expected_version: None,
+                })
+                .await
+                .unwrap();
+        }
+        for node in [&assumption, &direct, &required, &question] {
+            service
+                .resolve_node(
+                    &effort.slug,
+                    &node.id,
+                    "test",
+                    None,
+                    "resolved".into(),
+                    None,
+                    None,
+                    None,
+                    "test setup",
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let current = service.snapshot(&effort.slug).await.unwrap().0;
+        assert!(matches!(
+            service
+                .commit_invalidation(
+                    &effort.slug,
+                    &assumption.id,
+                    Validity::Invalid,
+                    "test",
+                    "stale",
+                    Some(current.version - 1),
+                )
+                .await,
+            Err(ApplicationError::Store(StoreError::VersionConflict { .. }))
+        ));
+        assert_eq!(
+            service
+                .node_history(&effort.slug, &assumption.id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let (_, version) = service
+            .commit_invalidation(
+                &effort.slug,
+                &assumption.id,
+                Validity::Invalid,
+                "test",
+                "premise disproven",
+                Some(current.version),
+            )
+            .await
+            .unwrap();
+        assert_eq!(version, current.version + 1);
+
+        assert_eq!(
+            service
+                .get_node(&effort.slug, &assumption.id)
+                .await
+                .unwrap()
+                .validity,
+            Validity::Invalid
+        );
+        assert_eq!(
+            service
+                .get_node(&effort.slug, &direct.id)
+                .await
+                .unwrap()
+                .validity,
+            Validity::Undermined
+        );
+        assert_eq!(
+            service
+                .get_node(&effort.slug, &required.id)
+                .await
+                .unwrap()
+                .validity,
+            Validity::ReviewRequired
+        );
+        assert_eq!(
+            service
+                .get_node(&effort.slug, &open.id)
+                .await
+                .unwrap()
+                .validity,
+            Validity::Current
+        );
+        let reopened = service.get_node(&effort.slug, &question.id).await.unwrap();
+        assert_eq!(reopened.lifecycle, Lifecycle::Open);
+        assert_eq!(reopened.validity, Validity::ReviewRequired);
+        for node in [&assumption, &direct, &required, &question] {
+            assert_eq!(
+                service
+                    .node_history(&effort.slug, &node.id)
+                    .await
+                    .unwrap()
+                    .len(),
+                3
+            );
+        }
     }
 
     #[tokio::test]

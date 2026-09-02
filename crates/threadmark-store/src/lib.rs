@@ -10,8 +10,7 @@ use sqlx::{
 use thiserror::Error;
 use threadmark_domain::{
     AuditEvent, Claim, Confidence, Edge, Effort, ExitCriterion, Finding, FogPatch, GraphSnapshot,
-    InvalidationPreview, Lifecycle, Node, NodeRevision, Reversibility, RiskLevel, Source,
-    Uncertainty, Workspace,
+    Lifecycle, Node, NodeRevision, Reversibility, RiskLevel, Source, Uncertainty, Workspace,
 };
 
 #[derive(Debug, Error)]
@@ -513,25 +512,24 @@ impl Store {
     pub async fn apply_invalidation(
         &self,
         effort_id: &str,
-        preview: &InvalidationPreview,
+        updates: &[(Node, NodeRevision)],
         event: &AuditEvent,
         expected_version: i64,
         now: &str,
     ) -> Result<i64, StoreError> {
         let mut tx = self.pool.begin().await?;
         check_version(&mut tx, effort_id, expected_version).await?;
-        for change in &preview.changes {
-            sqlx::query("UPDATE nodes SET validity=?,updated_at=? WHERE id=? AND effort_id=?")
-                .bind(change.to.as_str())
-                .bind(now)
-                .bind(&change.node_id)
+        for (node, revision) in updates {
+            sqlx::query("UPDATE nodes SET lifecycle=?,validity=?,current_revision=?,updated_at=? WHERE id=? AND effort_id=?")
+                .bind(node.lifecycle.as_str())
+                .bind(node.validity.as_str())
+                .bind(node.current_revision)
+                .bind(&node.updated_at)
+                .bind(&node.id)
                 .bind(effort_id)
                 .execute(&mut *tx)
                 .await?;
-        }
-        for question in &preview.reopened_questions {
-            sqlx::query("UPDATE nodes SET lifecycle='open',validity='review_required',updated_at=? WHERE id=? AND effort_id=?")
-                .bind(now).bind(question).bind(effort_id).execute(&mut *tx).await?;
+            insert_revision(&mut tx, revision).await?;
         }
         insert_event(&mut tx, event).await?;
         let version = bump_version(&mut tx, effort_id, now).await?;
