@@ -748,17 +748,20 @@ async fn check_version(
     effort_id: &str,
     expected: i64,
 ) -> Result<(), StoreError> {
-    let row = sqlx::query("SELECT version FROM efforts WHERE id=?")
+    let row = sqlx::query("SELECT version,status FROM efforts WHERE id=?")
         .bind(effort_id)
         .fetch_optional(&mut **tx)
         .await?
         .ok_or(StoreError::NotFound)?;
     let actual: i64 = row.get("version");
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(StoreError::VersionConflict { expected, actual })
+    if actual != expected {
+        return Err(StoreError::VersionConflict { expected, actual });
     }
+    let status: String = row.get("status");
+    if status != "active" {
+        return Err(StoreError::EffortInactive);
+    }
+    Ok(())
 }
 
 async fn bump_version(
