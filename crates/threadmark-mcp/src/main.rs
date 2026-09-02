@@ -94,7 +94,7 @@ async fn handle(service: &Service, request: &Value) -> Value {
 
 async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value> {
     match name {
-        "threadmark_list_efforts" => Ok(serde_json::to_value(service.list_efforts().await?)?),
+        "threadmark_list_efforts" => Ok(json!({"efforts": service.list_efforts().await?})),
         "threadmark_complete_effort" => Ok(serde_json::to_value(
             service
                 .complete_effort(
@@ -110,7 +110,7 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
         }
         "threadmark_get_frontier" => {
             let status = service.status(required(args, "effort")?).await?;
-            Ok(serde_json::to_value(status.frontier)?)
+            Ok(json!({"frontier": status.frontier}))
         }
         "threadmark_get_node" => Ok(serde_json::to_value(
             service
@@ -123,7 +123,7 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
         }
         "threadmark_lint" => {
             let status = service.status(required(args, "effort")?).await?;
-            Ok(serde_json::to_value(status.lint)?)
+            Ok(json!({"findings": status.lint}))
         }
         "threadmark_claim_next" => Ok(serde_json::to_value(
             service
@@ -577,6 +577,42 @@ async fn write_message(stdout: &mut tokio::io::Stdout, value: &Value) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+    use threadmark_application::CreateEffort;
+
+    #[tokio::test]
+    async fn collection_tools_return_object_structured_content() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = service
+            .create_effort(CreateEffort {
+                slug: "test".into(),
+                title: "Test".into(),
+                destination: "Test collection tools".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+
+        for (tool, args, field) in [
+            ("threadmark_list_efforts", json!({}), "efforts"),
+            (
+                "threadmark_get_frontier",
+                json!({"effort": effort.slug}),
+                "frontier",
+            ),
+            (
+                "threadmark_lint",
+                json!({"effort": effort.slug}),
+                "findings",
+            ),
+        ] {
+            let result = tool_result(call_tool(&service, tool, &args).await.unwrap(), false);
+            assert!(result["structuredContent"].is_object());
+            assert!(result["structuredContent"][field].is_array());
+        }
+    }
 
     #[test]
     fn claim_tools_do_not_accept_caller_identity() {

@@ -21,5 +21,8 @@ tracing-subscriber.workspace = true
 threadmark-application = { path = "../threadmark-application" }
 threadmark-domain = { path = "../threadmark-domain" }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true
