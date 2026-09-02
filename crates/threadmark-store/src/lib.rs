@@ -35,6 +35,8 @@ pub enum StoreError {
     ActiveClaims,
     #[error("entity was not found")]
     NotFound,
+    #[error("claim is not actively owned by {0}")]
+    ClaimNotOwned(String),
     #[error("effort version conflict: expected {expected}, actual {actual}")]
     VersionConflict { expected: i64, actual: i64 },
 }
@@ -359,9 +361,24 @@ impl Store {
         revision: Option<&NodeRevision>,
         event: &AuditEvent,
         expected_version: i64,
+        claimant: Option<&str>,
     ) -> Result<i64, StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         check_version(&mut tx, &node.effort_id, expected_version).await?;
+        if let Some(claimant) = claimant {
+            let claim = sqlx::query(
+                "SELECT 1 FROM claims WHERE node_id=? AND claimant=? \
+                 AND released_at IS NULL AND lease_expires_at>?",
+            )
+            .bind(&node.id)
+            .bind(claimant)
+            .bind(&node.updated_at)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if claim.is_none() {
+                return Err(StoreError::ClaimNotOwned(claimant.into()));
+            }
+        }
         sqlx::query("UPDATE nodes SET title=?,summary=?,lifecycle=?,validity=?,confidence=?,confidence_reason=?,reversibility=?,impact=?,uncertainty=?,cost_of_wrong=?,current_revision=?,updated_at=? WHERE id=?")
             .bind(&node.title).bind(&node.summary).bind(node.lifecycle.as_str()).bind(node.validity.as_str())
             .bind(node.confidence.map(Confidence::as_str)).bind(&node.confidence_reason)
@@ -401,8 +418,8 @@ impl Store {
         }
         sqlx::query("UPDATE claims SET released_at=?,release_reason='lease expired' WHERE node_id=? AND released_at IS NULL AND lease_expires_at<=?")
             .bind(now).bind(&claim.node_id).bind(now).execute(&mut *tx).await?;
-        let result = sqlx::query("INSERT INTO claims(id,node_id,actor_id,session_id,claimed_at,heartbeat_at,lease_expires_at) VALUES(?,?,?,?,?,?,?)")
-            .bind(&claim.id).bind(&claim.node_id).bind(&claim.actor_id).bind(&claim.session_id)
+        let result = sqlx::query("INSERT INTO claims(id,node_id,actor_id,claimant,claimed_at,heartbeat_at,lease_expires_at) VALUES(?,?,?,?,?,?,?)")
+            .bind(&claim.id).bind(&claim.node_id).bind(&claim.actor_id).bind(&claim.claimant)
             .bind(&claim.claimed_at).bind(&claim.heartbeat_at).bind(&claim.lease_expires_at)
             .execute(&mut *tx).await;
         if let Err(error) = result {
@@ -426,19 +443,52 @@ impl Store {
         Ok(())
     }
 
+    pub async fn reap_expired_claims(&self, effort_id: &str, now: &str) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "UPDATE claims SET released_at=?,release_reason='lease expired' \
+             WHERE released_at IS NULL AND lease_expires_at<=? \
+             AND node_id IN (SELECT id FROM nodes WHERE effort_id=?)",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(effort_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE nodes SET lifecycle='open',updated_at=? \
+             WHERE effort_id=? AND lifecycle='in_progress' \
+             AND NOT EXISTS (SELECT 1 FROM claims WHERE claims.node_id=nodes.id \
+                             AND claims.released_at IS NULL AND claims.lease_expires_at>?)",
+        )
+        .bind(now)
+        .bind(effort_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn release_claim(
         &self,
         claim_id: &str,
+        claimant: &str,
         now: &str,
         reason: &str,
         event: &AuditEvent,
     ) -> Result<(), StoreError> {
-        let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT node_id FROM claims WHERE id=? AND released_at IS NULL")
-            .bind(claim_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(StoreError::NotFound)?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query(
+            "SELECT node_id FROM claims WHERE id=? AND claimant=? \
+             AND released_at IS NULL AND lease_expires_at>?",
+        )
+        .bind(claim_id)
+        .bind(claimant)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| StoreError::ClaimNotOwned(claimant.into()))?;
         let node_id: String = row.get("node_id");
         sqlx::query("UPDATE claims SET released_at=?,release_reason=? WHERE id=?")
             .bind(now)
@@ -461,26 +511,26 @@ impl Store {
     pub async fn heartbeat_claim(
         &self,
         claim_id: &str,
-        session_id: &str,
+        claimant: &str,
         heartbeat: &str,
         expires: &str,
     ) -> Result<Claim, StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query(
             "UPDATE claims SET heartbeat_at=?,lease_expires_at=? \
-             WHERE id=? AND session_id=? AND released_at IS NULL AND lease_expires_at>? \
+             WHERE id=? AND claimant=? AND released_at IS NULL AND lease_expires_at>? \
              AND EXISTS (SELECT 1 FROM nodes JOIN efforts ON efforts.id=nodes.effort_id \
                          WHERE nodes.id=claims.node_id AND efforts.status='active')",
         )
         .bind(heartbeat)
         .bind(expires)
         .bind(claim_id)
-        .bind(session_id)
+        .bind(claimant)
         .bind(heartbeat)
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() != 1 {
-            return Err(StoreError::NotFound);
+            return Err(StoreError::ClaimNotOwned(claimant.into()));
         }
         let row = sqlx::query("SELECT * FROM claims WHERE id=?")
             .bind(claim_id)
@@ -885,7 +935,7 @@ fn row_to_claim(row: SqliteRow) -> Claim {
         id: row.get("id"),
         node_id: row.get("node_id"),
         actor_id: row.get("actor_id"),
-        session_id: row.get("session_id"),
+        claimant: row.get("claimant"),
         claimed_at: row.get("claimed_at"),
         heartbeat_at: row.get("heartbeat_at"),
         lease_expires_at: row.get("lease_expires_at"),
@@ -1078,5 +1128,36 @@ mod tests {
             store.get_node("effort", "node").await.unwrap().lifecycle,
             Lifecycle::Open
         );
+    }
+
+    #[tokio::test]
+    async fn reaping_an_expired_claim_reopens_its_node() {
+        let directory = TempDir::new().unwrap();
+        let store = Store::connect(&directory.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces(id,name,root_uri,schema_version,created_at,updated_at) VALUES('workspace','test','test',1,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO efforts(id,workspace_id,slug,title,destination,status,version,created_at,updated_at) VALUES('effort','workspace','test','test','test','active',1,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO nodes(id,effort_id,kind,title,lifecycle,validity,current_revision,created_at,updated_at) VALUES('node','effort','action','test','in_progress','current',0,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO node_revisions(node_id,revision,body,payload_json,actor_id,created_at) VALUES('node',0,'','{}','test','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO claims(id,node_id,actor_id,claimant,claimed_at,heartbeat_at,lease_expires_at) VALUES('claim','node','openai-codex','openai-codex','then','then','2020')")
+            .execute(&store.pool).await.unwrap();
+
+        store.reap_expired_claims("effort", "now").await.unwrap();
+
+        assert_eq!(
+            store.get_node("effort", "node").await.unwrap().lifecycle,
+            Lifecycle::Open
+        );
+        let released_at: Option<String> =
+            sqlx::query_scalar("SELECT released_at FROM claims WHERE id='claim'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(released_at.as_deref(), Some("now"));
     }
 }

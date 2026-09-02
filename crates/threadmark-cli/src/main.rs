@@ -230,7 +230,7 @@ enum ClaimCommand {
     Heartbeat {
         claim: String,
         #[arg(long)]
-        session: String,
+        actor: String,
         #[arg(long, default_value_t = 30)]
         lease_minutes: i64,
     },
@@ -244,8 +244,6 @@ struct ClaimArgs {
     effort: String,
     #[arg(long)]
     actor: String,
-    #[arg(long)]
-    session: String,
     #[arg(long, default_value_t = 30)]
     lease_minutes: i64,
 }
@@ -552,7 +550,7 @@ async fn dispatch(service: &Service, command: Command, json_output: bool) -> Res
         Command::Claim(command) => match command {
             ClaimCommand::Next(args) => {
                 let claim = service
-                    .claim_next(&args.effort, &args.actor, &args.session, args.lease_minutes)
+                    .claim_next(&args.effort, &args.actor, args.lease_minutes)
                     .await?;
                 output(json_output, &claim, || {
                     format!(
@@ -563,13 +561,7 @@ async fn dispatch(service: &Service, command: Command, json_output: bool) -> Res
             }
             ClaimCommand::Node { claim: args, node } => {
                 let claim = service
-                    .claim_node(
-                        &args.effort,
-                        &node,
-                        &args.actor,
-                        &args.session,
-                        args.lease_minutes,
-                    )
+                    .claim_node(&args.effort, &node, &args.actor, args.lease_minutes)
                     .await?;
                 output(json_output, &claim, || {
                     format!(
@@ -592,11 +584,11 @@ async fn dispatch(service: &Service, command: Command, json_output: bool) -> Res
             }
             ClaimCommand::Heartbeat {
                 claim,
-                session,
+                actor,
                 lease_minutes,
             } => {
                 let claim = service
-                    .heartbeat_claim(&claim, &session, lease_minutes)
+                    .heartbeat_claim(&claim, &actor, lease_minutes)
                     .await?;
                 output(json_output, &claim, || {
                     format!(
