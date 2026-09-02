@@ -373,14 +373,20 @@ impl Store {
 
     pub async fn update_node(
         &self,
-        node: &Node,
-        revision: Option<&NodeRevision>,
-        event: &AuditEvent,
+        node: &mut Node,
+        mut revision: Option<&mut NodeRevision>,
+        event: &mut AuditEvent,
         expected_version: i64,
         claim_guard: ClaimGuard<'_>,
     ) -> Result<i64, StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let cutoff = reap_expired_claims(&mut tx, &node.effort_id).await?;
+        node.updated_at.clone_from(&cutoff);
+        if let Some(revision) = revision.as_deref_mut() {
+            revision.created_at.clone_from(&cutoff);
+        }
+        event.occurred_at.clone_from(&cutoff);
+        event.after = Some(serde_json::to_value(&*node).expect("node is serializable"));
         check_version(&mut tx, &node.effort_id, expected_version).await?;
         if let ClaimGuard::MustOwn(claimant) | ClaimGuard::OwnIfClaimed(claimant) = claim_guard {
             let owner: Option<String> = sqlx::query_scalar(
@@ -739,9 +745,15 @@ impl Store {
     pub async fn snapshot_with_events(
         &self,
         effort_id: &str,
-    ) -> Result<(GraphSnapshot, Vec<AuditEvent>), StoreError> {
+    ) -> Result<(Effort, GraphSnapshot, Vec<Source>, Vec<AuditEvent>), StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         reap_expired_claims(&mut tx, effort_id).await?;
+        let effort = row_to_effort(
+            sqlx::query("SELECT * FROM efforts WHERE id=?")
+                .bind(effort_id)
+                .fetch_one(&mut *tx)
+                .await?,
+        )?;
         let nodes = sqlx::query("SELECT n.*,r.body,r.payload_json FROM nodes n JOIN node_revisions r ON r.node_id=n.id AND r.revision=n.current_revision WHERE n.effort_id=? ORDER BY n.created_at")
             .bind(effort_id).fetch_all(&mut *tx).await?.into_iter().map(row_to_node).collect::<Result<_,_>>()?;
         let edges = sqlx::query("SELECT * FROM edges WHERE effort_id=? ORDER BY created_at")
@@ -813,8 +825,16 @@ impl Store {
             .map(row_to_event)
             .collect::<Result<Vec<_>, _>>()?;
         sort_events(&mut events)?;
+        let sources = sqlx::query("SELECT * FROM sources WHERE effort_id=? ORDER BY created_at")
+            .bind(effort_id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(row_to_source)
+            .collect::<Result<Vec<_>, _>>()?;
         tx.commit().await?;
         Ok((
+            effort,
             GraphSnapshot {
                 nodes,
                 edges,
@@ -824,6 +844,7 @@ impl Store {
                 exit_criteria,
                 node_source_ids,
             },
+            sources,
             events,
         ))
     }

@@ -380,10 +380,17 @@ impl Service {
     pub async fn export_snapshot(
         &self,
         effort: &str,
-    ) -> Result<(Effort, GraphSnapshot, Vec<AuditEvent>), ApplicationError> {
+    ) -> Result<
+        (
+            Effort,
+            GraphSnapshot,
+            Vec<threadmark_domain::Source>,
+            Vec<AuditEvent>,
+        ),
+        ApplicationError,
+    > {
         let effort = self.get_effort(effort).await?;
-        let (snapshot, events) = self.store.snapshot_with_events(&effort.id).await?;
-        Ok((effort, snapshot, events))
+        Ok(self.store.snapshot_with_events(&effort.id).await?)
     }
 
     pub async fn status(&self, effort: &str) -> Result<EffortStatusView, ApplicationError> {
@@ -696,8 +703,8 @@ impl Service {
         node.current_revision += 1;
         node.updated_at = now();
         validate_node(&node)?;
-        let revision = revision(&node, actor_id, session_id, reason, &node.updated_at);
-        let audit = event(
+        let mut revision = revision(&node, actor_id, session_id, reason, &node.updated_at);
+        let mut audit = event(
             Some(&effort.id),
             actor_id,
             session_id,
@@ -711,7 +718,13 @@ impl Service {
         );
         let version = self
             .store
-            .update_node(&node, Some(&revision), &audit, expected, claim_guard)
+            .update_node(
+                &mut node,
+                Some(&mut revision),
+                &mut audit,
+                expected,
+                claim_guard,
+            )
             .await?;
         Ok((node, version))
     }
@@ -737,8 +750,8 @@ impl Service {
         node.validity = Validity::ReviewRequired;
         node.current_revision += 1;
         node.updated_at = now();
-        let revision = revision(&node, actor_id, None, reason, &node.updated_at);
-        let audit = event(
+        let mut revision = revision(&node, actor_id, None, reason, &node.updated_at);
+        let mut audit = event(
             Some(&effort.id),
             actor_id,
             None,
@@ -752,7 +765,13 @@ impl Service {
         );
         let version = self
             .store
-            .update_node(&node, Some(&revision), &audit, expected, ClaimGuard::None)
+            .update_node(
+                &mut node,
+                Some(&mut revision),
+                &mut audit,
+                expected,
+                ClaimGuard::None,
+            )
             .await?;
         Ok((node, version))
     }
@@ -1426,7 +1445,7 @@ mod tests {
         let node = add_test_node(&service, &effort.slug, NodeKind::Action, "expired").await;
         insert_expired_claim(&service, &effort, &node).await;
 
-        let (_, graph, events) = service.export_snapshot(&effort.slug).await.unwrap();
+        let (_, graph, _, events) = service.export_snapshot(&effort.slug).await.unwrap();
 
         assert_eq!(graph.nodes[0].lifecycle, Lifecycle::Open);
         assert!(
