@@ -134,14 +134,44 @@ impl Store {
             .await?;
         }
         if let Some(existing) = root_match.filter(|existing| existing.id != workspace.id) {
-            sqlx::query(
-                "UPDATE efforts SET slug = slug || '-' || id WHERE workspace_id = ? \
-                 AND EXISTS (SELECT 1 FROM efforts target WHERE target.workspace_id = ? AND target.slug = efforts.slug)",
+            let conflicts = sqlx::query(
+                "SELECT id,slug FROM efforts legacy WHERE workspace_id = ? \
+                 AND EXISTS (SELECT 1 FROM efforts target WHERE target.workspace_id = ? AND target.slug = legacy.slug) \
+                 ORDER BY id",
             )
             .bind(&existing.id)
             .bind(&workspace.id)
-            .execute(&mut *tx)
+            .fetch_all(&mut *tx)
             .await?;
+            for conflict in conflicts {
+                let id: String = conflict.get("id");
+                let slug: String = conflict.get("slug");
+                let mut suffix = 1;
+                loop {
+                    let candidate = if suffix == 1 {
+                        format!("{slug}-{id}")
+                    } else {
+                        format!("{slug}-{id}-{suffix}")
+                    };
+                    let exists: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM efforts WHERE workspace_id IN (?, ?) AND slug = ?",
+                    )
+                    .bind(&existing.id)
+                    .bind(&workspace.id)
+                    .bind(&candidate)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if exists == 0 {
+                        sqlx::query("UPDATE efforts SET slug = ? WHERE id = ?")
+                            .bind(candidate)
+                            .bind(id)
+                            .execute(&mut *tx)
+                            .await?;
+                        break;
+                    }
+                    suffix += 1;
+                }
+            }
             sqlx::query("UPDATE efforts SET workspace_id = ? WHERE workspace_id = ?")
                 .bind(&workspace.id)
                 .bind(&existing.id)

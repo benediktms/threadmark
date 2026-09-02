@@ -1162,6 +1162,16 @@ mod tests {
             })
             .await
             .unwrap();
+        service
+            .create_effort(CreateEffort {
+                slug: format!("effort-{}", legacy_effort.id),
+                title: "Existing suffix".into(),
+                destination: "Destination".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
         let timestamp = now();
         service
             .store
@@ -1213,11 +1223,11 @@ mod tests {
 
         let service = Service::open(directory.path()).await.unwrap();
         let efforts = service.list_efforts().await.unwrap();
-        assert_eq!(efforts.len(), 2);
+        assert_eq!(efforts.len(), 3);
         assert!(
             efforts
                 .iter()
-                .any(|effort| effort.slug == format!("effort-{}", legacy_effort.id))
+                .any(|effort| effort.slug == format!("effort-{}-2", legacy_effort.id))
         );
     }
 }
