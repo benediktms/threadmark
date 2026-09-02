@@ -1149,7 +1149,7 @@ mod tests {
     async fn migrates_a_root_matched_workspace_when_the_marker_id_already_exists() {
         let directory = TempDir::new().unwrap();
         let service = Service::init(directory.path(), "test").await.unwrap();
-        service
+        let legacy_effort = service
             .create_effort(CreateEffort {
                 slug: "effort".into(),
                 title: "Effort".into(),
@@ -1168,8 +1168,38 @@ mod tests {
                 root_uri: "other-worktree".into(),
                 schema_version: SCHEMA_VERSION,
                 created_at: timestamp.clone(),
-                updated_at: timestamp,
+                updated_at: timestamp.clone(),
             })
+            .await
+            .unwrap();
+        service
+            .store
+            .create_effort(
+                &Effort {
+                    id: "01TARGETEFFORT00000000000000".into(),
+                    workspace_id: "01TESTWORKSPACE000000000000".into(),
+                    slug: "effort".into(),
+                    title: "Target effort".into(),
+                    destination: "Destination".into(),
+                    scope_notes: String::new(),
+                    status: EffortStatus::Active,
+                    version: 1,
+                    created_at: timestamp.clone(),
+                    updated_at: timestamp.clone(),
+                },
+                &event(
+                    None,
+                    "test",
+                    None,
+                    "effort_created",
+                    "effort",
+                    "01TARGETEFFORT00000000000000",
+                    None,
+                    None,
+                    None,
+                    &timestamp,
+                ),
+            )
             .await
             .unwrap();
         std::fs::write(
@@ -1179,6 +1209,12 @@ mod tests {
         .unwrap();
 
         let service = Service::open(directory.path()).await.unwrap();
-        assert_eq!(service.list_efforts().await.unwrap().len(), 1);
+        let efforts = service.list_efforts().await.unwrap();
+        assert_eq!(efforts.len(), 2);
+        assert!(
+            efforts
+                .iter()
+                .any(|effort| effort.slug == format!("effort-{}", legacy_effort.id))
+        );
     }
 }

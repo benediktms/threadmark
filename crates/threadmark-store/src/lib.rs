@@ -134,6 +134,14 @@ impl Store {
             .await?;
         }
         if let Some(existing) = root_match.filter(|existing| existing.id != workspace.id) {
+            sqlx::query(
+                "UPDATE efforts SET slug = slug || '-' || id WHERE workspace_id = ? \
+                 AND EXISTS (SELECT 1 FROM efforts target WHERE target.workspace_id = ? AND target.slug = efforts.slug)",
+            )
+            .bind(&existing.id)
+            .bind(&workspace.id)
+            .execute(&mut *tx)
+            .await?;
             sqlx::query("UPDATE efforts SET workspace_id = ? WHERE workspace_id = ?")
                 .bind(&workspace.id)
                 .bind(&existing.id)
