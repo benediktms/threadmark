@@ -673,7 +673,6 @@ impl Service {
         claim_guard: ClaimGuard<'_>,
     ) -> Result<(Node, i64), ApplicationError> {
         let effort = self.active_effort(effort).await?;
-        self.store.reap_expired_claims(&effort.id).await?;
         let expected = expected_version.unwrap_or(effort.version);
         let mut node = self.store.get_node(&effort.id, selector).await?;
         let before = serde_json::to_value(&node)?;

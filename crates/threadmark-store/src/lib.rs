@@ -378,6 +378,7 @@ impl Store {
         claim_guard: ClaimGuard<'_>,
     ) -> Result<i64, StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        reap_expired_claims(&mut tx, &node.effort_id).await?;
         check_version(&mut tx, &node.effort_id, expected_version).await?;
         if let ClaimGuard::MustOwn(claimant) | ClaimGuard::OwnIfClaimed(claimant) = claim_guard {
             let owner: Option<String> = sqlx::query_scalar(
@@ -459,55 +460,7 @@ impl Store {
 
     pub async fn reap_expired_claims(&self, effort_id: &str) -> Result<(), StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let timestamp: String = sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
-            .fetch_one(&mut *tx)
-            .await?;
-        let claims = sqlx::query(
-            "SELECT claims.id,claims.node_id FROM claims \
-             JOIN nodes ON nodes.id=claims.node_id \
-             WHERE nodes.effort_id=? AND claims.released_at IS NULL \
-             AND julianday(claims.lease_expires_at)<=julianday(?)",
-        )
-        .bind(effort_id)
-        .bind(&timestamp)
-        .fetch_all(&mut *tx)
-        .await?;
-        for claim in claims {
-            let claim_id: String = claim.get("id");
-            let node_id: String = claim.get("node_id");
-            sqlx::query(
-                "UPDATE claims SET released_at=?,release_reason='lease expired' WHERE id=?",
-            )
-            .bind(&timestamp)
-            .bind(&claim_id)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                "UPDATE nodes SET lifecycle='open',updated_at=? \
-                 WHERE id=? AND lifecycle='in_progress'",
-            )
-            .bind(&timestamp)
-            .bind(&node_id)
-            .execute(&mut *tx)
-            .await?;
-            insert_event(
-                &mut tx,
-                &AuditEvent {
-                    id: Ulid::new().to_string(),
-                    effort_id: Some(effort_id.into()),
-                    actor_id: "system".into(),
-                    session_id: None,
-                    event_type: "claim_expired".into(),
-                    entity_type: "claim".into(),
-                    entity_id: claim_id,
-                    before: None,
-                    after: None,
-                    reason: Some("lease expired".into()),
-                    occurred_at: timestamp.clone(),
-                },
-            )
-            .await?;
-        }
+        reap_expired_claims(&mut tx, effort_id).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -868,17 +821,20 @@ impl Store {
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
             let event = row_to_event(row)?;
-            if occurred_from.is_some() || occurred_to.is_some() {
-                let occurred_at = parse_timestamp(&event.occurred_at)?;
-                if occurred_from.is_some_and(|bound| occurred_at < bound)
-                    || occurred_to.is_some_and(|bound| occurred_at > bound)
-                {
-                    continue;
-                }
+            let occurred_at = parse_timestamp(&event.occurred_at)?;
+            if occurred_from.is_some_and(|bound| occurred_at < bound)
+                || occurred_to.is_some_and(|bound| occurred_at > bound)
+            {
+                continue;
             }
-            events.push(event);
+            events.push((occurred_at, event));
         }
-        Ok(events)
+        events.sort_by(|(left_time, left), (right_time, right)| {
+            left_time
+                .cmp(right_time)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(events.into_iter().map(|(_, event)| event).collect())
     }
 
     pub async fn list_sources(&self, effort_id: &str) -> Result<Vec<Source>, StoreError> {
@@ -888,6 +844,60 @@ impl Store {
             .await?;
         rows.into_iter().map(row_to_source).collect()
     }
+}
+
+async fn reap_expired_claims(
+    tx: &mut Transaction<'_, Sqlite>,
+    effort_id: &str,
+) -> Result<(), StoreError> {
+    let timestamp: String = sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
+        .fetch_one(&mut **tx)
+        .await?;
+    let claims = sqlx::query(
+        "SELECT claims.id,claims.node_id FROM claims \
+         JOIN nodes ON nodes.id=claims.node_id \
+         WHERE nodes.effort_id=? AND claims.released_at IS NULL \
+         AND julianday(claims.lease_expires_at)<=julianday(?)",
+    )
+    .bind(effort_id)
+    .bind(&timestamp)
+    .fetch_all(&mut **tx)
+    .await?;
+    for claim in claims {
+        let claim_id: String = claim.get("id");
+        let node_id: String = claim.get("node_id");
+        sqlx::query("UPDATE claims SET released_at=?,release_reason='lease expired' WHERE id=?")
+            .bind(&timestamp)
+            .bind(&claim_id)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query(
+            "UPDATE nodes SET lifecycle='open',updated_at=? \
+             WHERE id=? AND lifecycle='in_progress'",
+        )
+        .bind(&timestamp)
+        .bind(&node_id)
+        .execute(&mut **tx)
+        .await?;
+        insert_event(
+            tx,
+            &AuditEvent {
+                id: Ulid::new().to_string(),
+                effort_id: Some(effort_id.into()),
+                actor_id: "system".into(),
+                session_id: None,
+                event_type: "claim_expired".into(),
+                entity_type: "claim".into(),
+                entity_id: claim_id,
+                before: None,
+                after: None,
+                reason: Some("lease expired".into()),
+                occurred_at: timestamp.clone(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn check_version(
@@ -1294,11 +1304,14 @@ mod tests {
             .execute(&store.pool).await.unwrap();
         sqlx::query("INSERT INTO events(id,effort_id,actor_id,event_type,entity_type,entity_id,occurred_at) VALUES('event','effort','test','node_created','node','node','2026-01-01T00:30:00.1231Z')")
             .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO events(id,effort_id,actor_id,event_type,entity_type,entity_id,occurred_at) VALUES('early','effort','test','ordered','node','node','2026-01-01T00:30:00.123Z'),('late','effort','test','ordered','node','node','2026-01-01T00:30:00.123456Z')")
+            .execute(&store.pool).await.unwrap();
 
         let events = store
             .list_events(
                 "workspace",
                 &EventFilter {
+                    event_type: Some("node_created".into()),
                     occurred_from: Some("2026-01-01T01:00:00+01:00".into()),
                     ..EventFilter::default()
                 },
@@ -1311,6 +1324,7 @@ mod tests {
             .list_events(
                 "workspace",
                 &EventFilter {
+                    event_type: Some("node_created".into()),
                     occurred_from: Some("2026-01-01T00:30:00.1234Z".into()),
                     ..EventFilter::default()
                 },
@@ -1318,6 +1332,21 @@ mod tests {
             .await
             .unwrap();
         assert!(events.is_empty());
+
+        let events = store
+            .list_events(
+                "workspace",
+                &EventFilter {
+                    event_type: Some("ordered".into()),
+                    ..EventFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            events.iter().map(|event| &event.id).collect::<Vec<_>>(),
+            ["early", "late"]
+        );
     }
 
     #[tokio::test]
