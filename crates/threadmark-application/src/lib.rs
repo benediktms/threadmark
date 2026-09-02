@@ -434,7 +434,17 @@ impl Service {
         mut filter: EventFilter,
     ) -> Result<Vec<AuditEvent>, ApplicationError> {
         if let Some(effort) = &filter.effort_id {
-            filter.effort_id = Some(self.get_effort(effort).await?.id);
+            let effort = self.get_effort(effort).await?;
+            if effort.status == EffortStatus::Active {
+                self.store.reap_expired_claims(&effort.id).await?;
+            }
+            filter.effort_id = Some(effort.id);
+        } else {
+            for effort in self.list_efforts().await? {
+                if effort.status == EffortStatus::Active {
+                    self.store.reap_expired_claims(&effort.id).await?;
+                }
+            }
         }
         Ok(self.store.list_events(&self.workspace.id, &filter).await?)
     }

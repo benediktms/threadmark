@@ -4,7 +4,7 @@ use std::{path::Path, str::FromStr, time::Duration};
 
 use serde_json::Value;
 use sqlx::{
-    Row, Sqlite, SqlitePool, Transaction,
+    QueryBuilder, Row, Sqlite, SqlitePool, Transaction,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow},
 };
 use thiserror::Error;
@@ -817,35 +817,43 @@ impl Store {
         workspace_id: &str,
         filter: &EventFilter,
     ) -> Result<Vec<AuditEvent>, StoreError> {
-        let rows = sqlx::query(
+        let mut query = QueryBuilder::<Sqlite>::new(
             "SELECT events.* FROM events JOIN efforts ON efforts.id=events.effort_id \
-             WHERE efforts.workspace_id=? \
-             AND (? IS NULL OR events.effort_id=?) \
-             AND (? IS NULL OR events.entity_type=?) \
-             AND (? IS NULL OR events.entity_id=?) \
-             AND (? IS NULL OR events.actor_id=?) \
-             AND (? IS NULL OR events.event_type=?) \
-             AND (? IS NULL OR events.occurred_at>=?) \
-             AND (? IS NULL OR events.occurred_at<=?) \
-             ORDER BY events.occurred_at,events.id",
-        )
-        .bind(workspace_id)
-        .bind(&filter.effort_id)
-        .bind(&filter.effort_id)
-        .bind(&filter.entity_type)
-        .bind(&filter.entity_type)
-        .bind(&filter.entity_id)
-        .bind(&filter.entity_id)
-        .bind(&filter.actor_id)
-        .bind(&filter.actor_id)
-        .bind(&filter.event_type)
-        .bind(&filter.event_type)
-        .bind(&filter.occurred_from)
-        .bind(&filter.occurred_from)
-        .bind(&filter.occurred_to)
-        .bind(&filter.occurred_to)
-        .fetch_all(&self.pool)
-        .await?;
+             WHERE efforts.workspace_id=",
+        );
+        query.push_bind(workspace_id);
+        if let Some(value) = &filter.effort_id {
+            query.push(" AND events.effort_id=").push_bind(value);
+        }
+        if let Some(value) = &filter.entity_type {
+            query.push(" AND events.entity_type=").push_bind(value);
+        }
+        if let Some(value) = &filter.entity_id {
+            query.push(" AND events.entity_id=").push_bind(value);
+        }
+        if let Some(value) = &filter.actor_id {
+            query.push(" AND events.actor_id=").push_bind(value);
+        }
+        if let Some(value) = &filter.event_type {
+            query.push(" AND events.event_type=").push_bind(value);
+        }
+        if let Some(value) = &filter.occurred_from {
+            query
+                .push(" AND julianday(events.occurred_at)>=julianday(")
+                .push_bind(value)
+                .push(")");
+        }
+        if let Some(value) = &filter.occurred_to {
+            query
+                .push(" AND julianday(events.occurred_at)<=julianday(")
+                .push_bind(value)
+                .push(")");
+        }
+        let rows = query
+            .push(" ORDER BY events.occurred_at,events.id")
+            .build()
+            .fetch_all(&self.pool)
+            .await?;
         rows.into_iter().map(row_to_event).collect()
     }
 
@@ -1232,6 +1240,33 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(expired, 1);
+    }
+
+    #[tokio::test]
+    async fn filters_event_times_as_instants() {
+        let directory = TempDir::new().unwrap();
+        let store = Store::connect(&directory.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces(id,name,root_uri,schema_version,created_at,updated_at) VALUES('workspace','test','test',1,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO efforts(id,workspace_id,slug,title,destination,status,version,created_at,updated_at) VALUES('effort','workspace','test','test','test','active',1,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO events(id,effort_id,actor_id,event_type,entity_type,entity_id,occurred_at) VALUES('event','effort','test','node_created','node','node','2026-01-01T00:30:00Z')")
+            .execute(&store.pool).await.unwrap();
+
+        let events = store
+            .list_events(
+                "workspace",
+                &EventFilter {
+                    occurred_from: Some("2026-01-01T01:00:00+01:00".into()),
+                    ..EventFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
     }
 
     #[tokio::test]
