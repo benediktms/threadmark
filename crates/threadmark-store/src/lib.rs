@@ -466,17 +466,30 @@ impl Store {
         heartbeat: &str,
         expires: &str,
     ) -> Result<Claim, StoreError> {
-        let result = sqlx::query("UPDATE claims SET heartbeat_at=?,lease_expires_at=? WHERE id=? AND session_id=? AND released_at IS NULL AND lease_expires_at>?")
-            .bind(heartbeat).bind(expires).bind(claim_id).bind(session_id).bind(heartbeat)
-            .execute(&self.pool).await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let result = sqlx::query(
+            "UPDATE claims SET heartbeat_at=?,lease_expires_at=? \
+             WHERE id=? AND session_id=? AND released_at IS NULL AND lease_expires_at>? \
+             AND EXISTS (SELECT 1 FROM nodes JOIN efforts ON efforts.id=nodes.effort_id \
+                         WHERE nodes.id=claims.node_id AND efforts.status='active')",
+        )
+        .bind(heartbeat)
+        .bind(expires)
+        .bind(claim_id)
+        .bind(session_id)
+        .bind(heartbeat)
+        .execute(&mut *tx)
+        .await?;
         if result.rows_affected() != 1 {
             return Err(StoreError::NotFound);
         }
         let row = sqlx::query("SELECT * FROM claims WHERE id=?")
             .bind(claim_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
-        Ok(row_to_claim(row))
+        let claim = row_to_claim(row);
+        tx.commit().await?;
+        Ok(claim)
     }
 
     pub async fn insert_fog(

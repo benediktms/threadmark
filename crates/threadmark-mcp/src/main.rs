@@ -193,6 +193,21 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                 .await?;
             Ok(json!({"effort_version":version}))
         }
+        "threadmark_add_exit_criterion" => {
+            let (criterion, version) = service
+                .add_exit_criterion(
+                    required(args, "effort")?,
+                    required(args, "criterion_type")?.into(),
+                    args.get("config").cloned().unwrap_or_else(|| json!({})),
+                    args.get("required")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                    required(args, "actor_id")?,
+                    args.get("expected_version").and_then(Value::as_i64),
+                )
+                .await?;
+            Ok(json!({"criterion":criterion,"effort_version":version}))
+        }
         "threadmark_add_node" => {
             let effort = required(args, "effort")?;
             let kind = NodeKind::from_str(required(args, "kind")?).map_err(anyhow::Error::msg)?;
@@ -395,6 +410,14 @@ fn tool_definitions() -> Vec<Value> {
             object(
                 &["effort", "node", "source", "relationship", "actor_id"],
                 json!({"effort":{"type":"string"},"node":{"type":"string"},"source":{"type":"string"},"relationship":{"type":"string"},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
+            ),
+        ),
+        tool(
+            "threadmark_add_exit_criterion",
+            "Add a deterministic exit criterion to an effort",
+            object(
+                &["effort", "criterion_type", "actor_id"],
+                json!({"effort":{"type":"string"},"criterion_type":{"type":"string"},"config":{},"required":{"type":"boolean"},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
             ),
         ),
         tool(
