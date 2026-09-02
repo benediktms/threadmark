@@ -524,7 +524,6 @@ impl Store {
         .bind(expires)
         .bind(claim_id)
         .bind(claimant)
-        .bind(heartbeat)
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() != 1 {
