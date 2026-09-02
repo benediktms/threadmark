@@ -377,6 +377,15 @@ impl Service {
         Ok((effort, snapshot))
     }
 
+    pub async fn export_snapshot(
+        &self,
+        effort: &str,
+    ) -> Result<(Effort, GraphSnapshot, Vec<AuditEvent>), ApplicationError> {
+        let effort = self.get_effort(effort).await?;
+        let (snapshot, events) = self.store.snapshot_with_events(&effort.id).await?;
+        Ok((effort, snapshot, events))
+    }
+
     pub async fn status(&self, effort: &str) -> Result<EffortStatusView, ApplicationError> {
         let effort = self.get_effort(effort).await?;
         self.store.reap_expired_claims(&effort.id).await?;
@@ -1421,14 +1430,11 @@ mod tests {
         let node = add_test_node(&service, &effort.slug, NodeKind::Action, "expired").await;
         insert_expired_claim(&service, &effort, &node).await;
 
-        let (_, graph) = service.snapshot(&effort.slug).await.unwrap();
+        let (_, graph, events) = service.export_snapshot(&effort.slug).await.unwrap();
 
         assert_eq!(graph.nodes[0].lifecycle, Lifecycle::Open);
         assert!(
-            service
-                .effort_history(&effort.slug)
-                .await
-                .unwrap()
+            events
                 .iter()
                 .any(|event| event.event_type == "claim_expired")
         );

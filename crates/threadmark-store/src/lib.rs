@@ -237,6 +237,7 @@ impl Store {
         expected_version: i64,
     ) -> Result<i64, StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let cutoff = reap_expired_claims(&mut tx, &effort.id).await?;
         check_version(&mut tx, &effort.id, expected_version).await?;
         let result = sqlx::query(
             "UPDATE efforts SET status='completed' WHERE id=? AND status='active' \
@@ -246,7 +247,7 @@ impl Store {
         )
         .bind(&effort.id)
         .bind(&effort.id)
-        .bind(&effort.updated_at)
+        .bind(&cutoff)
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
@@ -256,7 +257,7 @@ impl Store {
                  AND claims.lease_expires_at>?",
             )
             .bind(&effort.id)
-            .bind(&effort.updated_at)
+            .bind(&cutoff)
             .fetch_one(&mut *tx)
             .await?;
             return Err(if active_claims > 0 {
@@ -378,14 +379,15 @@ impl Store {
         claim_guard: ClaimGuard<'_>,
     ) -> Result<i64, StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        reap_expired_claims(&mut tx, &node.effort_id).await?;
+        let cutoff = reap_expired_claims(&mut tx, &node.effort_id).await?;
         check_version(&mut tx, &node.effort_id, expected_version).await?;
         if let ClaimGuard::MustOwn(claimant) | ClaimGuard::OwnIfClaimed(claimant) = claim_guard {
             let owner: Option<String> = sqlx::query_scalar(
                 "SELECT claimant FROM claims WHERE node_id=? \
-                 AND released_at IS NULL AND julianday(lease_expires_at)>julianday('now')",
+                 AND released_at IS NULL AND julianday(lease_expires_at)>julianday(?)",
             )
             .bind(&node.id)
+            .bind(&cutoff)
             .fetch_optional(&mut *tx)
             .await?;
             if owner.as_deref().is_some_and(|owner| owner != claimant)
@@ -739,6 +741,98 @@ impl Store {
         })
     }
 
+    pub async fn snapshot_with_events(
+        &self,
+        effort_id: &str,
+    ) -> Result<(GraphSnapshot, Vec<AuditEvent>), StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        reap_expired_claims(&mut tx, effort_id).await?;
+        let nodes = sqlx::query("SELECT n.*,r.body,r.payload_json FROM nodes n JOIN node_revisions r ON r.node_id=n.id AND r.revision=n.current_revision WHERE n.effort_id=? ORDER BY n.created_at")
+            .bind(effort_id).fetch_all(&mut *tx).await?.into_iter().map(row_to_node).collect::<Result<_,_>>()?;
+        let edges = sqlx::query("SELECT * FROM edges WHERE effort_id=? ORDER BY created_at")
+            .bind(effort_id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(row_to_edge)
+            .collect::<Result<_, _>>()?;
+        let claims = sqlx::query("SELECT c.* FROM claims c JOIN nodes n ON n.id=c.node_id WHERE n.effort_id=? ORDER BY c.claimed_at")
+            .bind(effort_id).fetch_all(&mut *tx).await?.into_iter().map(row_to_claim).collect();
+        let fog_rows =
+            sqlx::query("SELECT * FROM fog_patches WHERE effort_id=? ORDER BY created_at")
+                .bind(effort_id)
+                .fetch_all(&mut *tx)
+                .await?;
+        let mut fog_patches = Vec::new();
+        for row in fog_rows {
+            let id: String = row.get("id");
+            let graduated_to =
+                sqlx::query("SELECT node_id FROM fog_graduations WHERE fog_id=? ORDER BY node_id")
+                    .bind(&id)
+                    .fetch_all(&mut *tx)
+                    .await?
+                    .into_iter()
+                    .map(|row| row.get("node_id"))
+                    .collect();
+            fog_patches.push(FogPatch {
+                id,
+                effort_id: row.get("effort_id"),
+                title: row.get("title"),
+                description: row.get("description"),
+                anchor_node_id: row.get("anchor_node_id"),
+                status: parse("fog.status", row.get::<String, _>("status"))?,
+                graduated_to,
+                created_at: row.get("created_at"),
+                updated_at: row.get("updated_at"),
+            });
+        }
+        let findings = sqlx::query("SELECT * FROM findings WHERE effort_id=? ORDER BY created_at")
+            .bind(effort_id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(row_to_finding)
+            .collect::<Result<_, _>>()?;
+        let exit_criteria =
+            sqlx::query("SELECT * FROM exit_criteria WHERE effort_id=? ORDER BY created_at")
+                .bind(effort_id)
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .map(row_to_criterion)
+                .collect::<Result<_, _>>()?;
+        let source_rows = sqlx::query("SELECT ns.node_id,ns.source_id FROM node_sources ns JOIN nodes n ON n.id=ns.node_id WHERE n.effort_id=?")
+            .bind(effort_id).fetch_all(&mut *tx).await?;
+        let mut node_source_ids = std::collections::HashMap::new();
+        for row in source_rows {
+            node_source_ids
+                .entry(row.get("node_id"))
+                .or_insert_with(Vec::new)
+                .push(row.get("source_id"));
+        }
+        let mut events = sqlx::query("SELECT * FROM events WHERE effort_id=?")
+            .bind(effort_id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(row_to_event)
+            .collect::<Result<Vec<_>, _>>()?;
+        sort_events(&mut events)?;
+        tx.commit().await?;
+        Ok((
+            GraphSnapshot {
+                nodes,
+                edges,
+                claims,
+                fog_patches,
+                findings,
+                exit_criteria,
+                node_source_ids,
+            },
+            events,
+        ))
+    }
+
     pub async fn list_fog(&self, effort_id: &str) -> Result<Vec<FogPatch>, StoreError> {
         let rows = sqlx::query("SELECT * FROM fog_patches WHERE effort_id=? ORDER BY created_at")
             .bind(effort_id)
@@ -829,12 +923,9 @@ impl Store {
             }
             events.push((occurred_at, event));
         }
-        events.sort_by(|(left_time, left), (right_time, right)| {
-            left_time
-                .cmp(right_time)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        Ok(events.into_iter().map(|(_, event)| event).collect())
+        let mut events = events.into_iter().map(|(_, event)| event).collect();
+        sort_events(&mut events)?;
+        Ok(events)
     }
 
     pub async fn list_sources(&self, effort_id: &str) -> Result<Vec<Source>, StoreError> {
@@ -849,7 +940,7 @@ impl Store {
 async fn reap_expired_claims(
     tx: &mut Transaction<'_, Sqlite>,
     effort_id: &str,
-) -> Result<(), StoreError> {
+) -> Result<String, StoreError> {
     let timestamp: String = sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
         .fetch_one(&mut **tx)
         .await?;
@@ -897,7 +988,7 @@ async fn reap_expired_claims(
         )
         .await?;
     }
-    Ok(())
+    Ok(timestamp)
 }
 
 async fn check_version(
@@ -1154,6 +1245,20 @@ fn time_candidate(value: OffsetDateTime, seconds: i64) -> Option<String> {
             .format(&Rfc3339)
             .expect("RFC 3339 formatting succeeds"),
     )
+}
+
+fn sort_events(events: &mut Vec<AuditEvent>) -> Result<(), StoreError> {
+    let mut parsed = events
+        .drain(..)
+        .map(|event| Ok((parse_timestamp(&event.occurred_at)?, event)))
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    parsed.sort_by(|(left_time, left), (right_time, right)| {
+        left_time
+            .cmp(right_time)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    events.extend(parsed.into_iter().map(|(_, event)| event));
+    Ok(())
 }
 
 #[cfg(test)]
