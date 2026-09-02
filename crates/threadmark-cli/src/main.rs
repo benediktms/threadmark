@@ -1021,12 +1021,12 @@ async fn add_node(service: &Service, args: NodeAddArgs, json_output: bool) -> Re
 }
 
 async fn package(service: &Service, effort: &str, include_events: bool) -> Result<PortableEffort> {
-    let (effort_value, graph) = service.snapshot(effort).await?;
-    let sources = service.sources(effort).await?;
-    let events = if include_events {
-        service.effort_history(effort).await?
+    let (effort_value, graph, sources, events) = if include_events {
+        service.export_snapshot(effort).await?
     } else {
-        vec![]
+        let (effort, graph) = service.snapshot(effort).await?;
+        let sources = service.sources(&effort.slug).await?;
+        (effort, graph, sources, vec![])
     };
     Ok(PortableEffort {
         format_version: 1,

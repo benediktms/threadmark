@@ -349,6 +349,8 @@ pub struct AuditEvent {
     pub id: Id,
     pub effort_id: Option<Id>,
     pub actor_id: String,
+    #[schemars(skip)]
+    #[serde(skip_serializing)]
     pub session_id: Option<String>,
     pub event_type: String,
     pub entity_type: String,
@@ -357,6 +359,50 @@ pub struct AuditEvent {
     pub after: Option<Value>,
     pub reason: Option<String>,
     pub occurred_at: String,
+}
+
+#[derive(Clone, Debug, Default, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct EventFilter {
+    pub effort_id: Option<Id>,
+    pub entity_type: Option<String>,
+    pub entity_id: Option<Id>,
+    pub actor_id: Option<String>,
+    pub event_type: Option<String>,
+    pub occurred_from: Option<String>,
+    pub occurred_to: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::AuditEvent;
+
+    #[test]
+    fn audit_event_hides_sessions_on_write_without_losing_them_on_read() {
+        let event: AuditEvent = serde_json::from_value(json!({
+            "id": "event",
+            "effort_id": "effort",
+            "actor_id": "actor",
+            "session_id": "session",
+            "event_type": "node_created",
+            "entity_type": "node",
+            "entity_id": "node",
+            "before": null,
+            "after": null,
+            "reason": null,
+            "occurred_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+
+        assert_eq!(event.session_id.as_deref(), Some("session"));
+        assert!(
+            serde_json::to_value(event)
+                .unwrap()
+                .get("session_id")
+                .is_none()
+        );
+    }
 }
 
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]

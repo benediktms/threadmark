@@ -12,10 +12,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use threadmark_domain::{
-    AuditEvent, Claim, Confidence, DomainError, Edge, Effort, EffortStatus, ExitCriterion, Finding,
-    FindingStatus, FindingType, FogPatch, FogStatus, FrontierEntry, GraphSnapshot,
-    InvalidationPreview, Lifecycle, LintFinding, NewEdge, NewNode, Node, NodeRevision,
-    ReadinessReport, RiskLevel, Source, SourceKind, SourceTrust, Validity, Workspace,
+    AuditEvent, Claim, Confidence, DomainError, Edge, Effort, EffortStatus, EventFilter,
+    ExitCriterion, Finding, FindingStatus, FindingType, FogPatch, FogStatus, FrontierEntry,
+    GraphSnapshot, InvalidationPreview, Lifecycle, LintFinding, NewEdge, NewNode, Node,
+    NodeRevision, ReadinessReport, RiskLevel, Source, SourceKind, SourceTrust, Validity, Workspace,
     calculate_frontier, evaluate_readiness, lint_graph, preview_invalidation, validate_edge,
 };
 use threadmark_store::{ClaimGuard, Store, StoreError};
@@ -370,8 +370,27 @@ impl Service {
         effort: &str,
     ) -> Result<(Effort, GraphSnapshot), ApplicationError> {
         let effort = self.get_effort(effort).await?;
+        if effort.status == EffortStatus::Active {
+            self.store.reap_expired_claims(&effort.id).await?;
+        }
         let snapshot = self.store.snapshot(&effort.id).await?;
         Ok((effort, snapshot))
+    }
+
+    pub async fn export_snapshot(
+        &self,
+        effort: &str,
+    ) -> Result<
+        (
+            Effort,
+            GraphSnapshot,
+            Vec<threadmark_domain::Source>,
+            Vec<AuditEvent>,
+        ),
+        ApplicationError,
+    > {
+        let effort = self.get_effort(effort).await?;
+        Ok(self.store.snapshot_with_events(&effort.id).await?)
     }
 
     pub async fn status(&self, effort: &str) -> Result<EffortStatusView, ApplicationError> {
@@ -422,8 +441,31 @@ impl Service {
     }
 
     pub async fn effort_history(&self, effort: &str) -> Result<Vec<AuditEvent>, ApplicationError> {
-        let effort = self.get_effort(effort).await?;
-        Ok(self.store.list_events(&effort.id).await?)
+        self.history(EventFilter {
+            effort_id: Some(effort.into()),
+            ..EventFilter::default()
+        })
+        .await
+    }
+
+    pub async fn history(
+        &self,
+        mut filter: EventFilter,
+    ) -> Result<Vec<AuditEvent>, ApplicationError> {
+        if let Some(effort) = &filter.effort_id {
+            let effort = self.get_effort(effort).await?;
+            if effort.status == EffortStatus::Active {
+                self.store.reap_expired_claims(&effort.id).await?;
+            }
+            filter.effort_id = Some(effort.id);
+        } else {
+            for effort in self.list_efforts().await? {
+                if effort.status == EffortStatus::Active {
+                    self.store.reap_expired_claims(&effort.id).await?;
+                }
+            }
+        }
+        Ok(self.store.list_events(&self.workspace.id, &filter).await?)
     }
 
     pub async fn claim_next(
@@ -486,7 +528,7 @@ impl Service {
             None,
             &timestamp,
         );
-        self.store.insert_claim(&claim, &timestamp, &audit).await?;
+        self.store.insert_claim(&claim, &audit).await?;
         Ok(claim)
     }
 
@@ -661,8 +703,8 @@ impl Service {
         node.current_revision += 1;
         node.updated_at = now();
         validate_node(&node)?;
-        let revision = revision(&node, actor_id, session_id, reason, &node.updated_at);
-        let audit = event(
+        let mut revision = revision(&node, actor_id, session_id, reason, &node.updated_at);
+        let mut audit = event(
             Some(&effort.id),
             actor_id,
             session_id,
@@ -676,7 +718,13 @@ impl Service {
         );
         let version = self
             .store
-            .update_node(&node, Some(&revision), &audit, expected, claim_guard)
+            .update_node(
+                &mut node,
+                Some(&mut revision),
+                &mut audit,
+                expected,
+                claim_guard,
+            )
             .await?;
         Ok((node, version))
     }
@@ -702,8 +750,8 @@ impl Service {
         node.validity = Validity::ReviewRequired;
         node.current_revision += 1;
         node.updated_at = now();
-        let revision = revision(&node, actor_id, None, reason, &node.updated_at);
-        let audit = event(
+        let mut revision = revision(&node, actor_id, None, reason, &node.updated_at);
+        let mut audit = event(
             Some(&effort.id),
             actor_id,
             None,
@@ -717,7 +765,13 @@ impl Service {
         );
         let version = self
             .store
-            .update_node(&node, Some(&revision), &audit, expected, ClaimGuard::None)
+            .update_node(
+                &mut node,
+                Some(&mut revision),
+                &mut audit,
+                expected,
+                ClaimGuard::None,
+            )
             .await?;
         Ok((node, version))
     }
@@ -1267,6 +1321,34 @@ mod tests {
             .0
     }
 
+    async fn insert_expired_claim(service: &Service, effort: &Effort, node: &Node) {
+        let timestamp = now();
+        let claim = Claim {
+            id: id(),
+            node_id: node.id.clone(),
+            actor_id: "test".into(),
+            claimant: "test".into(),
+            claimed_at: timestamp.clone(),
+            heartbeat_at: timestamp.clone(),
+            lease_expires_at: "2020-01-01T00:00:00Z".into(),
+            released_at: None,
+            release_reason: None,
+        };
+        let audit = event(
+            Some(&effort.id),
+            "test",
+            None,
+            "claim_acquired",
+            "claim",
+            &claim.id,
+            None,
+            None,
+            None,
+            &timestamp,
+        );
+        service.store.insert_claim(&claim, &audit).await.unwrap();
+    }
+
     #[tokio::test]
     async fn creates_effort_and_frontier_node() {
         let directory = TempDir::new().unwrap();
@@ -1307,6 +1389,113 @@ mod tests {
         let status = service.status("cache").await.unwrap();
         assert_eq!(status.frontier.len(), 1);
         assert!(!status.readiness.ready);
+    }
+
+    #[tokio::test]
+    async fn filters_history_without_session_data() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = service
+            .create_effort(CreateEffort {
+                slug: "history".into(),
+                title: "History".into(),
+                destination: "Test history filters".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        let node = add_test_node(&service, &effort.slug, NodeKind::Action, "recorded").await;
+
+        let events = service
+            .history(EventFilter {
+                effort_id: Some(effort.slug),
+                entity_type: Some("node".into()),
+                entity_id: Some(node.id),
+                actor_id: Some("test".into()),
+                event_type: Some("node_created".into()),
+                occurred_from: Some(node.created_at.clone()),
+                occurred_to: Some(node.created_at),
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            serde_json::to_value(&events[0])
+                .unwrap()
+                .get("session_id")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_reaps_expired_claims_before_reading_the_graph() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = service
+            .create_effort(CreateEffort {
+                slug: "export".into(),
+                title: "Export".into(),
+                destination: "Test snapshot consistency".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        let node = add_test_node(&service, &effort.slug, NodeKind::Action, "expired").await;
+        insert_expired_claim(&service, &effort, &node).await;
+
+        let (_, graph, _, events) = service.export_snapshot(&effort.slug).await.unwrap();
+
+        assert_eq!(graph.nodes[0].lifecycle, Lifecycle::Open);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "claim_expired")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolving_after_a_lease_expiry_records_the_expiration() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = service
+            .create_effort(CreateEffort {
+                slug: "resolve".into(),
+                title: "Resolve".into(),
+                destination: "Test expiration before resolution".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        let node = add_test_node(&service, &effort.slug, NodeKind::Action, "expired").await;
+        insert_expired_claim(&service, &effort, &node).await;
+
+        service
+            .resolve_node(
+                &effort.slug,
+                &node.id,
+                "test",
+                None,
+                "resolved".into(),
+                None,
+                None,
+                None,
+                "resolved",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            service
+                .effort_history(&effort.slug)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| event.event_type == "claim_expired")
+        );
     }
 
     #[tokio::test]

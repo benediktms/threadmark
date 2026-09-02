@@ -4,14 +4,19 @@ use std::{path::Path, str::FromStr, time::Duration};
 
 use serde_json::Value;
 use sqlx::{
-    Row, Sqlite, SqlitePool, Transaction,
+    QueryBuilder, Row, Sqlite, SqlitePool, Transaction,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow},
 };
 use thiserror::Error;
 use threadmark_domain::{
-    AuditEvent, Claim, Confidence, Edge, Effort, ExitCriterion, Finding, FogPatch, GraphSnapshot,
-    Lifecycle, Node, NodeRevision, Reversibility, RiskLevel, Source, Uncertainty, Workspace,
+    AuditEvent, Claim, Confidence, Edge, Effort, EventFilter, ExitCriterion, Finding, FogPatch,
+    GraphSnapshot, Lifecycle, Node, NodeRevision, Reversibility, RiskLevel, Source, Uncertainty,
+    Workspace,
 };
+use time::{
+    Duration as TimeDuration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339,
+};
+use ulid::Ulid;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -27,6 +32,8 @@ pub enum StoreError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("invalid RFC 3339 timestamp: {0}")]
+    InvalidTimestamp(String),
     #[error("active claim already exists for node {0}")]
     ClaimConflict(String),
     #[error("effort is not active")]
@@ -70,6 +77,7 @@ impl Store {
             .connect_with(options)
             .await?;
         sqlx::migrate!().run(&pool).await?;
+        normalize_event_timestamps(&pool).await?;
         Ok(Self { pool })
     }
 
@@ -230,6 +238,7 @@ impl Store {
         expected_version: i64,
     ) -> Result<i64, StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let cutoff = reap_expired_claims(&mut tx, &effort.id).await?;
         check_version(&mut tx, &effort.id, expected_version).await?;
         let result = sqlx::query(
             "UPDATE efforts SET status='completed' WHERE id=? AND status='active' \
@@ -239,7 +248,7 @@ impl Store {
         )
         .bind(&effort.id)
         .bind(&effort.id)
-        .bind(&effort.updated_at)
+        .bind(&cutoff)
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
@@ -249,7 +258,7 @@ impl Store {
                  AND claims.lease_expires_at>?",
             )
             .bind(&effort.id)
-            .bind(&effort.updated_at)
+            .bind(&cutoff)
             .fetch_one(&mut *tx)
             .await?;
             return Err(if active_claims > 0 {
@@ -364,20 +373,28 @@ impl Store {
 
     pub async fn update_node(
         &self,
-        node: &Node,
-        revision: Option<&NodeRevision>,
-        event: &AuditEvent,
+        node: &mut Node,
+        mut revision: Option<&mut NodeRevision>,
+        event: &mut AuditEvent,
         expected_version: i64,
         claim_guard: ClaimGuard<'_>,
     ) -> Result<i64, StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let cutoff = reap_expired_claims(&mut tx, &node.effort_id).await?;
+        node.updated_at.clone_from(&cutoff);
+        if let Some(revision) = revision.as_deref_mut() {
+            revision.created_at.clone_from(&cutoff);
+        }
+        event.occurred_at.clone_from(&cutoff);
+        event.after = Some(serde_json::to_value(&*node).expect("node is serializable"));
         check_version(&mut tx, &node.effort_id, expected_version).await?;
         if let ClaimGuard::MustOwn(claimant) | ClaimGuard::OwnIfClaimed(claimant) = claim_guard {
             let owner: Option<String> = sqlx::query_scalar(
                 "SELECT claimant FROM claims WHERE node_id=? \
-                 AND released_at IS NULL AND julianday(lease_expires_at)>julianday('now')",
+                 AND released_at IS NULL AND julianday(lease_expires_at)>julianday(?)",
             )
             .bind(&node.id)
+            .bind(&cutoff)
             .fetch_optional(&mut *tx)
             .await?;
             if owner.as_deref().is_some_and(|owner| owner != claimant)
@@ -406,13 +423,9 @@ impl Store {
         Ok(version)
     }
 
-    pub async fn insert_claim(
-        &self,
-        claim: &Claim,
-        now: &str,
-        event: &AuditEvent,
-    ) -> Result<(), StoreError> {
+    pub async fn insert_claim(&self, claim: &Claim, event: &AuditEvent) -> Result<(), StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let cutoff = reap_expired_claims_for_node(&mut tx, &claim.node_id).await?;
         let active = sqlx::query(
             "SELECT 1 FROM efforts JOIN nodes ON nodes.effort_id=efforts.id \
              WHERE nodes.id=? AND efforts.status='active'",
@@ -423,8 +436,6 @@ impl Store {
         if active.is_none() {
             return Err(StoreError::EffortInactive);
         }
-        sqlx::query("UPDATE claims SET released_at=?,release_reason='lease expired' WHERE node_id=? AND released_at IS NULL AND lease_expires_at<=?")
-            .bind(now).bind(&claim.node_id).bind(now).execute(&mut *tx).await?;
         let result = sqlx::query("INSERT INTO claims(id,node_id,actor_id,claimant,claimed_at,heartbeat_at,lease_expires_at) VALUES(?,?,?,?,?,?,?)")
             .bind(&claim.id).bind(&claim.node_id).bind(&claim.actor_id).bind(&claim.claimant)
             .bind(&claim.claimed_at).bind(&claim.heartbeat_at).bind(&claim.lease_expires_at)
@@ -441,7 +452,7 @@ impl Store {
         sqlx::query(
             "UPDATE nodes SET lifecycle='in_progress',updated_at=? WHERE id=? AND lifecycle='open'",
         )
-        .bind(now)
+        .bind(&cutoff)
         .bind(&claim.node_id)
         .execute(&mut *tx)
         .await?;
@@ -452,30 +463,7 @@ impl Store {
 
     pub async fn reap_expired_claims(&self, effort_id: &str) -> Result<(), StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let timestamp: String = sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
-            .fetch_one(&mut *tx)
-            .await?;
-        sqlx::query(
-            "UPDATE nodes SET lifecycle='open',updated_at=? \
-             WHERE effort_id=? AND lifecycle='in_progress' \
-             AND id IN (SELECT node_id FROM claims \
-                        WHERE released_at IS NULL AND julianday(lease_expires_at)<=julianday(?))",
-        )
-        .bind(&timestamp)
-        .bind(effort_id)
-        .bind(&timestamp)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE claims SET released_at=?,release_reason='lease expired' \
-             WHERE released_at IS NULL AND julianday(lease_expires_at)<=julianday(?) \
-             AND node_id IN (SELECT id FROM nodes WHERE effort_id=?)",
-        )
-        .bind(&timestamp)
-        .bind(&timestamp)
-        .bind(effort_id)
-        .execute(&mut *tx)
-        .await?;
+        reap_expired_claims(&mut tx, effort_id).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -754,6 +742,113 @@ impl Store {
         })
     }
 
+    pub async fn snapshot_with_events(
+        &self,
+        effort_id: &str,
+    ) -> Result<(Effort, GraphSnapshot, Vec<Source>, Vec<AuditEvent>), StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        reap_expired_claims(&mut tx, effort_id).await?;
+        let effort = row_to_effort(
+            sqlx::query("SELECT * FROM efforts WHERE id=?")
+                .bind(effort_id)
+                .fetch_one(&mut *tx)
+                .await?,
+        )?;
+        let nodes = sqlx::query("SELECT n.*,r.body,r.payload_json FROM nodes n JOIN node_revisions r ON r.node_id=n.id AND r.revision=n.current_revision WHERE n.effort_id=? ORDER BY n.created_at")
+            .bind(effort_id).fetch_all(&mut *tx).await?.into_iter().map(row_to_node).collect::<Result<_,_>>()?;
+        let edges = sqlx::query("SELECT * FROM edges WHERE effort_id=? ORDER BY created_at")
+            .bind(effort_id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(row_to_edge)
+            .collect::<Result<_, _>>()?;
+        let claims = sqlx::query("SELECT c.* FROM claims c JOIN nodes n ON n.id=c.node_id WHERE n.effort_id=? ORDER BY c.claimed_at")
+            .bind(effort_id).fetch_all(&mut *tx).await?.into_iter().map(row_to_claim).collect();
+        let fog_rows =
+            sqlx::query("SELECT * FROM fog_patches WHERE effort_id=? ORDER BY created_at")
+                .bind(effort_id)
+                .fetch_all(&mut *tx)
+                .await?;
+        let mut fog_patches = Vec::new();
+        for row in fog_rows {
+            let id: String = row.get("id");
+            let graduated_to =
+                sqlx::query("SELECT node_id FROM fog_graduations WHERE fog_id=? ORDER BY node_id")
+                    .bind(&id)
+                    .fetch_all(&mut *tx)
+                    .await?
+                    .into_iter()
+                    .map(|row| row.get("node_id"))
+                    .collect();
+            fog_patches.push(FogPatch {
+                id,
+                effort_id: row.get("effort_id"),
+                title: row.get("title"),
+                description: row.get("description"),
+                anchor_node_id: row.get("anchor_node_id"),
+                status: parse("fog.status", row.get::<String, _>("status"))?,
+                graduated_to,
+                created_at: row.get("created_at"),
+                updated_at: row.get("updated_at"),
+            });
+        }
+        let findings = sqlx::query("SELECT * FROM findings WHERE effort_id=? ORDER BY created_at")
+            .bind(effort_id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(row_to_finding)
+            .collect::<Result<_, _>>()?;
+        let exit_criteria =
+            sqlx::query("SELECT * FROM exit_criteria WHERE effort_id=? ORDER BY created_at")
+                .bind(effort_id)
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .map(row_to_criterion)
+                .collect::<Result<_, _>>()?;
+        let source_rows = sqlx::query("SELECT ns.node_id,ns.source_id FROM node_sources ns JOIN nodes n ON n.id=ns.node_id WHERE n.effort_id=?")
+            .bind(effort_id).fetch_all(&mut *tx).await?;
+        let mut node_source_ids = std::collections::HashMap::new();
+        for row in source_rows {
+            node_source_ids
+                .entry(row.get("node_id"))
+                .or_insert_with(Vec::new)
+                .push(row.get("source_id"));
+        }
+        let mut events = sqlx::query("SELECT * FROM events WHERE effort_id=?")
+            .bind(effort_id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(row_to_event)
+            .collect::<Result<Vec<_>, _>>()?;
+        sort_events(&mut events)?;
+        let sources = sqlx::query("SELECT * FROM sources WHERE effort_id=? ORDER BY created_at")
+            .bind(effort_id)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(row_to_source)
+            .collect::<Result<Vec<_>, _>>()?;
+        tx.commit().await?;
+        Ok((
+            effort,
+            GraphSnapshot {
+                nodes,
+                edges,
+                claims,
+                fog_patches,
+                findings,
+                exit_criteria,
+                node_source_ids,
+            },
+            sources,
+            events,
+        ))
+    }
+
     pub async fn list_fog(&self, effort_id: &str) -> Result<Vec<FogPatch>, StoreError> {
         let rows = sqlx::query("SELECT * FROM fog_patches WHERE effort_id=? ORDER BY created_at")
             .bind(effort_id)
@@ -785,12 +880,68 @@ impl Store {
         Ok(patches)
     }
 
-    pub async fn list_events(&self, effort_id: &str) -> Result<Vec<AuditEvent>, StoreError> {
-        let rows = sqlx::query("SELECT * FROM events WHERE effort_id=? ORDER BY occurred_at,id")
-            .bind(effort_id)
+    pub async fn list_events(
+        &self,
+        workspace_id: &str,
+        filter: &EventFilter,
+    ) -> Result<Vec<AuditEvent>, StoreError> {
+        let occurred_from = filter
+            .occurred_from
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?;
+        let occurred_to = filter
+            .occurred_to
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?;
+        let occurred_from_candidate = occurred_from.and_then(|value| time_candidate(value, -1));
+        let occurred_to_candidate = occurred_to.and_then(|value| time_candidate(value, 1));
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT events.* FROM events JOIN efforts ON efforts.id=events.effort_id \
+             WHERE efforts.workspace_id=",
+        );
+        query.push_bind(workspace_id);
+        if let Some(value) = &filter.effort_id {
+            query.push(" AND events.effort_id=").push_bind(value);
+        }
+        if let Some(value) = &filter.entity_type {
+            query.push(" AND events.entity_type=").push_bind(value);
+        }
+        if let Some(value) = &filter.entity_id {
+            query.push(" AND events.entity_id=").push_bind(value);
+        }
+        if let Some(value) = &filter.actor_id {
+            query.push(" AND events.actor_id=").push_bind(value);
+        }
+        if let Some(value) = &filter.event_type {
+            query.push(" AND events.event_type=").push_bind(value);
+        }
+        if let Some(value) = &occurred_from_candidate {
+            query.push(" AND events.occurred_at>").push_bind(value);
+        }
+        if let Some(value) = &occurred_to_candidate {
+            query.push(" AND events.occurred_at<").push_bind(value);
+        }
+        let rows = query
+            .push(" ORDER BY events.occurred_at,events.id")
+            .build()
             .fetch_all(&self.pool)
             .await?;
-        rows.into_iter().map(row_to_event).collect()
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            let event = row_to_event(row)?;
+            let occurred_at = parse_timestamp(&event.occurred_at)?;
+            if occurred_from.is_some_and(|bound| occurred_at < bound)
+                || occurred_to.is_some_and(|bound| occurred_at > bound)
+            {
+                continue;
+            }
+            events.push((occurred_at, event));
+        }
+        let mut events = events.into_iter().map(|(_, event)| event).collect();
+        sort_events(&mut events)?;
+        Ok(events)
     }
 
     pub async fn list_sources(&self, effort_id: &str) -> Result<Vec<Source>, StoreError> {
@@ -800,6 +951,71 @@ impl Store {
             .await?;
         rows.into_iter().map(row_to_source).collect()
     }
+}
+
+async fn reap_expired_claims(
+    tx: &mut Transaction<'_, Sqlite>,
+    effort_id: &str,
+) -> Result<String, StoreError> {
+    let timestamp: String = sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
+        .fetch_one(&mut **tx)
+        .await?;
+    let claims = sqlx::query(
+        "SELECT claims.id,claims.node_id FROM claims \
+         JOIN nodes ON nodes.id=claims.node_id \
+         WHERE nodes.effort_id=? AND claims.released_at IS NULL \
+         AND julianday(claims.lease_expires_at)<=julianday(?)",
+    )
+    .bind(effort_id)
+    .bind(&timestamp)
+    .fetch_all(&mut **tx)
+    .await?;
+    for claim in claims {
+        let claim_id: String = claim.get("id");
+        let node_id: String = claim.get("node_id");
+        sqlx::query("UPDATE claims SET released_at=?,release_reason='lease expired' WHERE id=?")
+            .bind(&timestamp)
+            .bind(&claim_id)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query(
+            "UPDATE nodes SET lifecycle='open',updated_at=? \
+             WHERE id=? AND lifecycle='in_progress'",
+        )
+        .bind(&timestamp)
+        .bind(&node_id)
+        .execute(&mut **tx)
+        .await?;
+        insert_event(
+            tx,
+            &AuditEvent {
+                id: Ulid::new().to_string(),
+                effort_id: Some(effort_id.into()),
+                actor_id: "system".into(),
+                session_id: None,
+                event_type: "claim_expired".into(),
+                entity_type: "claim".into(),
+                entity_id: claim_id,
+                before: None,
+                after: None,
+                reason: Some("lease expired".into()),
+                occurred_at: timestamp.clone(),
+            },
+        )
+        .await?;
+    }
+    Ok(timestamp)
+}
+
+async fn reap_expired_claims_for_node(
+    tx: &mut Transaction<'_, Sqlite>,
+    node_id: &str,
+) -> Result<String, StoreError> {
+    let effort_id: String = sqlx::query_scalar("SELECT effort_id FROM nodes WHERE id=?")
+        .bind(node_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    reap_expired_claims(tx, &effort_id).await
 }
 
 async fn check_version(
@@ -856,12 +1072,13 @@ async fn insert_event(
     tx: &mut Transaction<'_, Sqlite>,
     event: &AuditEvent,
 ) -> Result<(), StoreError> {
+    let occurred_at = normalize_timestamp(&event.occurred_at)?;
     sqlx::query("INSERT INTO events(id,effort_id,actor_id,session_id,event_type,entity_type,entity_id,before_json,after_json,reason,occurred_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&event.id).bind(&event.effort_id).bind(&event.actor_id).bind(&event.session_id)
         .bind(&event.event_type).bind(&event.entity_type).bind(&event.entity_id)
         .bind(event.before.as_ref().map(|value| serde_json::to_string(value).expect("JSON value serializes")))
         .bind(event.after.as_ref().map(|value| serde_json::to_string(value).expect("JSON value serializes")))
-        .bind(&event.reason).bind(&event.occurred_at).execute(&mut **tx).await?;
+        .bind(&event.reason).bind(occurred_at).execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -1042,6 +1259,62 @@ fn parse_optional_json(
     value.map(|value| parse_json(field, value)).transpose()
 }
 
+fn parse_timestamp(value: &str) -> Result<OffsetDateTime, StoreError> {
+    OffsetDateTime::parse(value, &Rfc3339).map_err(|_| StoreError::InvalidTimestamp(value.into()))
+}
+
+fn normalize_timestamp(value: &str) -> Result<String, StoreError> {
+    parse_timestamp(value)?
+        .to_offset(UtcOffset::UTC)
+        .format(&Rfc3339)
+        .map_err(|_| StoreError::InvalidTimestamp(value.into()))
+}
+
+async fn normalize_event_timestamps(pool: &SqlitePool) -> Result<(), StoreError> {
+    let rows = sqlx::query("SELECT id,occurred_at FROM events")
+        .fetch_all(pool)
+        .await?;
+    for row in rows {
+        let id: String = row.get("id");
+        let occurred_at: String = row.get("occurred_at");
+        let normalized = normalize_timestamp(&occurred_at)?;
+        if normalized != occurred_at {
+            sqlx::query("UPDATE events SET occurred_at=? WHERE id=?")
+                .bind(normalized)
+                .bind(id)
+                .execute(pool)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+fn time_candidate(value: OffsetDateTime, seconds: i64) -> Option<String> {
+    let value = value
+        .to_offset(UtcOffset::UTC)
+        .checked_add(TimeDuration::seconds(seconds))?;
+    Some(
+        OffsetDateTime::from_unix_timestamp(value.unix_timestamp())
+            .expect("parsed timestamp is within the Unix timestamp range")
+            .format(&Rfc3339)
+            .expect("RFC 3339 formatting succeeds"),
+    )
+}
+
+fn sort_events(events: &mut Vec<AuditEvent>) -> Result<(), StoreError> {
+    let mut parsed = events
+        .drain(..)
+        .map(|event| Ok((parse_timestamp(&event.occurred_at)?, event)))
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    parsed.sort_by(|(left_time, left), (right_time, right)| {
+        left_time
+            .cmp(right_time)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    events.extend(parsed.into_iter().map(|(_, event)| event));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1127,7 +1400,7 @@ mod tests {
             before: None,
             after: None,
             reason: None,
-            occurred_at: "later".into(),
+            occurred_at: "2026-01-01T00:00:00Z".into(),
         };
 
         store
@@ -1169,6 +1442,70 @@ mod tests {
                 .await
                 .unwrap();
         assert!(released_at.is_some());
+        let expired: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE event_type='claim_expired' AND entity_id='claim'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(expired, 1);
+    }
+
+    #[tokio::test]
+    async fn filters_event_times_as_instants_without_losing_precision() {
+        let directory = TempDir::new().unwrap();
+        let store = Store::connect(&directory.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces(id,name,root_uri,schema_version,created_at,updated_at) VALUES('workspace','test','test',1,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO efforts(id,workspace_id,slug,title,destination,status,version,created_at,updated_at) VALUES('effort','workspace','test','test','test','active',1,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO events(id,effort_id,actor_id,event_type,entity_type,entity_id,occurred_at) VALUES('event','effort','test','node_created','node','node','2026-01-01T00:30:00.1231Z')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO events(id,effort_id,actor_id,event_type,entity_type,entity_id,occurred_at) VALUES('early','effort','test','ordered','node','node','2026-01-01T00:30:00.123Z'),('late','effort','test','ordered','node','node','2026-01-01T00:30:00.123456Z')")
+            .execute(&store.pool).await.unwrap();
+
+        let events = store
+            .list_events(
+                "workspace",
+                &EventFilter {
+                    event_type: Some("node_created".into()),
+                    occurred_from: Some("2026-01-01T01:00:00+01:00".into()),
+                    ..EventFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        let events = store
+            .list_events(
+                "workspace",
+                &EventFilter {
+                    event_type: Some("node_created".into()),
+                    occurred_from: Some("2026-01-01T00:30:00.1234Z".into()),
+                    ..EventFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(events.is_empty());
+
+        let events = store
+            .list_events(
+                "workspace",
+                &EventFilter {
+                    event_type: Some("ordered".into()),
+                    ..EventFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            events.iter().map(|event| &event.id).collect::<Vec<_>>(),
+            ["early", "late"]
+        );
     }
 
     #[tokio::test]
