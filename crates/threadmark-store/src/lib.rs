@@ -448,19 +448,17 @@ impl Store {
             "UPDATE nodes SET lifecycle='open',updated_at=? \
              WHERE effort_id=? AND lifecycle='in_progress' \
              AND id IN (SELECT node_id FROM claims \
-                        WHERE released_at IS NULL AND lease_expires_at<=?)",
+                        WHERE released_at IS NULL AND julianday(lease_expires_at)<=julianday('now'))",
         )
         .bind(now)
         .bind(effort_id)
-        .bind(now)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
             "UPDATE claims SET released_at=?,release_reason='lease expired' \
-             WHERE released_at IS NULL AND lease_expires_at<=? \
+             WHERE released_at IS NULL AND julianday(lease_expires_at)<=julianday('now') \
              AND node_id IN (SELECT id FROM nodes WHERE effort_id=?)",
         )
-        .bind(now)
         .bind(now)
         .bind(effort_id)
         .execute(&mut *tx)
