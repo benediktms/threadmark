@@ -722,7 +722,14 @@ impl Service {
         );
         let version = self
             .store
-            .apply_invalidation(&effort.id, &updates, &audit, expected, &timestamp)
+            .apply_invalidation(
+                &effort.id,
+                &updates,
+                &preview.reopened_questions,
+                &audit,
+                expected,
+                &timestamp,
+            )
             .await?;
         Ok((preview, version))
     }
