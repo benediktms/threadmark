@@ -131,6 +131,13 @@ enum EffortCommand {
         #[arg(long, default_value = "human")]
         actor: String,
     },
+    Complete {
+        effort: String,
+        #[arg(long, default_value = "human")]
+        actor: String,
+        #[arg(long)]
+        expected_version: Option<i64>,
+    },
     List,
     Show {
         effort: String,
@@ -411,6 +418,18 @@ async fn dispatch(service: &Service, command: Command, json_output: bool) -> Res
                         })
                         .collect::<Vec<_>>()
                         .join("\n")
+                })
+            }
+            EffortCommand::Complete {
+                effort,
+                actor,
+                expected_version,
+            } => {
+                let effort = service
+                    .complete_effort(&effort, &actor, expected_version)
+                    .await?;
+                output(json_output, &effort, || {
+                    format!("Completed effort {} ({})", effort.title, effort.id)
                 })
             }
             EffortCommand::Show { effort } => {

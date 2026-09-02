@@ -4,7 +4,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{Value, json};
 use threadmark_application::{AddEdge, AddNode, Service};
-use threadmark_domain::{Confidence, EdgeType, Lifecycle, NewEdge, NewNode, NodeKind, Validity};
+use threadmark_domain::{
+    Confidence, EdgeType, Lifecycle, NewEdge, NewNode, NodeKind, SourceKind, SourceTrust, Validity,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing_subscriber::EnvFilter;
 
@@ -93,6 +95,15 @@ async fn handle(service: &Service, request: &Value) -> Value {
 async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value> {
     match name {
         "threadmark_list_efforts" => Ok(serde_json::to_value(service.list_efforts().await?)?),
+        "threadmark_complete_effort" => Ok(serde_json::to_value(
+            service
+                .complete_effort(
+                    required(args, "effort")?,
+                    required(args, "actor_id")?,
+                    args.get("expected_version").and_then(Value::as_i64),
+                )
+                .await?,
+        )?),
         "threadmark_get_context" => {
             let effort = required(args, "effort")?;
             Ok(serde_json::to_value(service.status(effort).await?)?)
@@ -151,6 +162,51 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                 )
                 .await?;
             Ok(json!({"released": true}))
+        }
+        "threadmark_add_source" => {
+            let (source, version) = service
+                .add_source(
+                    required(args, "effort")?,
+                    SourceKind::from_str(required(args, "kind")?).map_err(anyhow::Error::msg)?,
+                    required(args, "title")?.into(),
+                    args.get("uri").and_then(Value::as_str).map(str::to_owned),
+                    args.get("excerpt")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    parse_optional(args, "trust")?.unwrap_or(SourceTrust::Unreviewed),
+                    required(args, "actor_id")?,
+                    args.get("expected_version").and_then(Value::as_i64),
+                )
+                .await?;
+            Ok(json!({"source":source,"effort_version":version}))
+        }
+        "threadmark_attach_source" => {
+            let version = service
+                .attach_source(
+                    required(args, "effort")?,
+                    required(args, "node")?,
+                    required(args, "source")?,
+                    required(args, "relationship")?,
+                    required(args, "actor_id")?,
+                    args.get("expected_version").and_then(Value::as_i64),
+                )
+                .await?;
+            Ok(json!({"effort_version":version}))
+        }
+        "threadmark_add_exit_criterion" => {
+            let (criterion, version) = service
+                .add_exit_criterion(
+                    required(args, "effort")?,
+                    required(args, "criterion_type")?.into(),
+                    args.get("config").cloned().unwrap_or_else(|| json!({})),
+                    args.get("required")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                    required(args, "actor_id")?,
+                    args.get("expected_version").and_then(Value::as_i64),
+                )
+                .await?;
+            Ok(json!({"criterion":criterion,"effort_version":version}))
         }
         "threadmark_add_node" => {
             let effort = required(args, "effort")?;
@@ -287,6 +343,14 @@ fn tool_definitions() -> Vec<Value> {
             json!({"type":"object","properties":{}}),
         ),
         tool(
+            "threadmark_complete_effort",
+            "Complete a readiness-passing effort",
+            object(
+                &["effort", "actor_id"],
+                json!({"effort":{"type":"string"},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
+            ),
+        ),
+        tool(
             "threadmark_get_context",
             "Get low-resolution effort context, readiness, frontier, and findings",
             object(&["effort"], json!({"effort":{"type":"string"}})),
@@ -330,6 +394,30 @@ fn tool_definitions() -> Vec<Value> {
             object(
                 &["effort", "claim_id", "actor_id"],
                 json!({"effort":{"type":"string"},"claim_id":{"type":"string"},"actor_id":{"type":"string"},"reason":{"type":"string"}}),
+            ),
+        ),
+        tool(
+            "threadmark_add_source",
+            "Record structured provenance for an effort",
+            object(
+                &["effort", "kind", "title", "actor_id"],
+                json!({"effort":{"type":"string"},"kind":{"type":"string"},"title":{"type":"string"},"uri":{"type":"string"},"excerpt":{"type":"string"},"trust":{"type":"string"},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
+            ),
+        ),
+        tool(
+            "threadmark_attach_source",
+            "Attach recorded provenance to a node",
+            object(
+                &["effort", "node", "source", "relationship", "actor_id"],
+                json!({"effort":{"type":"string"},"node":{"type":"string"},"source":{"type":"string"},"relationship":{"type":"string"},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
+            ),
+        ),
+        tool(
+            "threadmark_add_exit_criterion",
+            "Add a deterministic exit criterion to an effort",
+            object(
+                &["effort", "criterion_type", "actor_id"],
+                json!({"effort":{"type":"string"},"criterion_type":{"type":"string"},"config":{},"required":{"type":"boolean"},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
             ),
         ),
         tool(

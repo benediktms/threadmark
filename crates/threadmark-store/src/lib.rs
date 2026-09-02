@@ -30,6 +30,10 @@ pub enum StoreError {
     },
     #[error("active claim already exists for node {0}")]
     ClaimConflict(String),
+    #[error("effort is not active")]
+    EffortInactive,
+    #[error("effort has active claims")]
+    ActiveClaims,
     #[error("entity was not found")]
     NotFound,
     #[error("effort version conflict: expected {expected}, actual {actual}")]
@@ -211,6 +215,47 @@ impl Store {
         Ok(())
     }
 
+    pub async fn complete_effort(
+        &self,
+        effort: &Effort,
+        event: &AuditEvent,
+        expected_version: i64,
+    ) -> Result<i64, StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        check_version(&mut tx, &effort.id, expected_version).await?;
+        let result = sqlx::query(
+            "UPDATE efforts SET status='completed' WHERE id=? AND status='active' \
+             AND NOT EXISTS (SELECT 1 FROM claims JOIN nodes ON nodes.id=claims.node_id \
+                             WHERE nodes.effort_id=? AND claims.released_at IS NULL \
+                             AND claims.lease_expires_at>?)",
+        )
+        .bind(&effort.id)
+        .bind(&effort.id)
+        .bind(&effort.updated_at)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            let active_claims: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM claims JOIN nodes ON nodes.id=claims.node_id \
+                 WHERE nodes.effort_id=? AND claims.released_at IS NULL \
+                 AND claims.lease_expires_at>?",
+            )
+            .bind(&effort.id)
+            .bind(&effort.updated_at)
+            .fetch_one(&mut *tx)
+            .await?;
+            return Err(if active_claims > 0 {
+                StoreError::ActiveClaims
+            } else {
+                StoreError::EffortInactive
+            });
+        }
+        insert_event(&mut tx, event).await?;
+        let version = bump_version(&mut tx, &effort.id, &effort.updated_at).await?;
+        tx.commit().await?;
+        Ok(version)
+    }
+
     pub async fn list_efforts(&self, workspace_id: &str) -> Result<Vec<Effort>, StoreError> {
         let rows = sqlx::query("SELECT * FROM efforts WHERE workspace_id = ? ORDER BY created_at")
             .bind(workspace_id)
@@ -344,7 +389,17 @@ impl Store {
         now: &str,
         event: &AuditEvent,
     ) -> Result<(), StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let active = sqlx::query(
+            "SELECT 1 FROM efforts JOIN nodes ON nodes.effort_id=efforts.id \
+             WHERE nodes.id=? AND efforts.status='active'",
+        )
+        .bind(&claim.node_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if active.is_none() {
+            return Err(StoreError::EffortInactive);
+        }
         sqlx::query("UPDATE claims SET released_at=?,release_reason='lease expired' WHERE node_id=? AND released_at IS NULL AND lease_expires_at<=?")
             .bind(now).bind(&claim.node_id).bind(now).execute(&mut *tx).await?;
         let result = sqlx::query("INSERT INTO claims(id,node_id,actor_id,session_id,claimed_at,heartbeat_at,lease_expires_at) VALUES(?,?,?,?,?,?,?)")
@@ -411,17 +466,30 @@ impl Store {
         heartbeat: &str,
         expires: &str,
     ) -> Result<Claim, StoreError> {
-        let result = sqlx::query("UPDATE claims SET heartbeat_at=?,lease_expires_at=? WHERE id=? AND session_id=? AND released_at IS NULL AND lease_expires_at>?")
-            .bind(heartbeat).bind(expires).bind(claim_id).bind(session_id).bind(heartbeat)
-            .execute(&self.pool).await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let result = sqlx::query(
+            "UPDATE claims SET heartbeat_at=?,lease_expires_at=? \
+             WHERE id=? AND session_id=? AND released_at IS NULL AND lease_expires_at>? \
+             AND EXISTS (SELECT 1 FROM nodes JOIN efforts ON efforts.id=nodes.effort_id \
+                         WHERE nodes.id=claims.node_id AND efforts.status='active')",
+        )
+        .bind(heartbeat)
+        .bind(expires)
+        .bind(claim_id)
+        .bind(session_id)
+        .bind(heartbeat)
+        .execute(&mut *tx)
+        .await?;
         if result.rows_affected() != 1 {
             return Err(StoreError::NotFound);
         }
         let row = sqlx::query("SELECT * FROM claims WHERE id=?")
             .bind(claim_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
-        Ok(row_to_claim(row))
+        let claim = row_to_claim(row);
+        tx.commit().await?;
+        Ok(claim)
     }
 
     pub async fn insert_fog(
@@ -680,17 +748,20 @@ async fn check_version(
     effort_id: &str,
     expected: i64,
 ) -> Result<(), StoreError> {
-    let row = sqlx::query("SELECT version FROM efforts WHERE id=?")
+    let row = sqlx::query("SELECT version,status FROM efforts WHERE id=?")
         .bind(effort_id)
         .fetch_optional(&mut **tx)
         .await?
         .ok_or(StoreError::NotFound)?;
     let actual: i64 = row.get("version");
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(StoreError::VersionConflict { expected, actual })
+    if actual != expected {
+        return Err(StoreError::VersionConflict { expected, actual });
     }
+    let status: String = row.get("status");
+    if status != "active" {
+        return Err(StoreError::EffortInactive);
+    }
+    Ok(())
 }
 
 async fn bump_version(
