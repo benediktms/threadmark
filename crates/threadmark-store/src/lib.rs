@@ -450,29 +450,29 @@ impl Store {
         Ok(())
     }
 
-    pub async fn reap_expired_claims(&self, effort_id: &str, now: &str) -> Result<(), StoreError> {
+    pub async fn reap_expired_claims(&self, effort_id: &str) -> Result<(), StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let expiry: f64 = sqlx::query_scalar("SELECT julianday('now')")
+        let timestamp: String = sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
             .fetch_one(&mut *tx)
             .await?;
         sqlx::query(
             "UPDATE nodes SET lifecycle='open',updated_at=? \
              WHERE effort_id=? AND lifecycle='in_progress' \
              AND id IN (SELECT node_id FROM claims \
-                        WHERE released_at IS NULL AND julianday(lease_expires_at)<=?)",
+                        WHERE released_at IS NULL AND julianday(lease_expires_at)<=julianday(?))",
         )
-        .bind(now)
+        .bind(&timestamp)
         .bind(effort_id)
-        .bind(expiry)
+        .bind(&timestamp)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
             "UPDATE claims SET released_at=?,release_reason='lease expired' \
-             WHERE released_at IS NULL AND julianday(lease_expires_at)<=? \
+             WHERE released_at IS NULL AND julianday(lease_expires_at)<=julianday(?) \
              AND node_id IN (SELECT id FROM nodes WHERE effort_id=?)",
         )
-        .bind(now)
-        .bind(expiry)
+        .bind(&timestamp)
+        .bind(&timestamp)
         .bind(effort_id)
         .execute(&mut *tx)
         .await?;
@@ -526,12 +526,14 @@ impl Store {
     ) -> Result<Claim, StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query(
-            "UPDATE claims SET heartbeat_at=?,lease_expires_at=? \
+            "UPDATE claims SET heartbeat_at=?,lease_expires_at=CASE \
+             WHEN julianday(lease_expires_at)>julianday(?) THEN lease_expires_at ELSE ? END \
              WHERE id=? AND claimant=? AND released_at IS NULL AND julianday(lease_expires_at)>julianday('now') \
              AND EXISTS (SELECT 1 FROM nodes JOIN efforts ON efforts.id=nodes.effort_id \
                          WHERE nodes.id=claims.node_id AND efforts.status='active')",
         )
         .bind(heartbeat)
+        .bind(expires)
         .bind(expires)
         .bind(claim_id)
         .bind(claimant)
@@ -1155,7 +1157,7 @@ mod tests {
         sqlx::query("INSERT INTO claims(id,node_id,actor_id,claimant,claimed_at,heartbeat_at,lease_expires_at) VALUES('claim','node','openai-codex','openai-codex','then','then','2020')")
             .execute(&store.pool).await.unwrap();
 
-        store.reap_expired_claims("effort", "now").await.unwrap();
+        store.reap_expired_claims("effort").await.unwrap();
 
         assert_eq!(
             store.get_node("effort", "node").await.unwrap().lifecycle,
@@ -1166,7 +1168,7 @@ mod tests {
                 .fetch_one(&store.pool)
                 .await
                 .unwrap();
-        assert_eq!(released_at.as_deref(), Some("now"));
+        assert!(released_at.is_some());
     }
 
     #[tokio::test]
@@ -1182,7 +1184,7 @@ mod tests {
         sqlx::query("INSERT INTO nodes(id,effort_id,kind,title,lifecycle,validity,current_revision,created_at,updated_at) VALUES('node','effort','action','test','in_progress','current',0,'then','then')")
             .execute(&store.pool).await.unwrap();
 
-        store.reap_expired_claims("effort", "now").await.unwrap();
+        store.reap_expired_claims("effort").await.unwrap();
 
         let row = sqlx::query("SELECT lifecycle,updated_at FROM nodes WHERE id='node'")
             .fetch_one(&store.pool)

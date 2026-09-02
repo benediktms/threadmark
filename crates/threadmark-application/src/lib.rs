@@ -376,7 +376,7 @@ impl Service {
 
     pub async fn status(&self, effort: &str) -> Result<EffortStatusView, ApplicationError> {
         let effort = self.get_effort(effort).await?;
-        self.store.reap_expired_claims(&effort.id, &now()).await?;
+        self.store.reap_expired_claims(&effort.id).await?;
         let graph = self.store.snapshot(&effort.id).await?;
         let frontier = calculate_frontier(&graph, &now());
         let readiness = evaluate_readiness(&graph);
@@ -433,7 +433,7 @@ impl Service {
         lease_minutes: i64,
     ) -> Result<Claim, ApplicationError> {
         let effort = self.active_effort(effort).await?;
-        self.store.reap_expired_claims(&effort.id, &now()).await?;
+        self.store.reap_expired_claims(&effort.id).await?;
         let graph = self.store.snapshot(&effort.id).await?;
         let timestamp = now();
         let frontier = calculate_frontier(&graph, &timestamp);
@@ -452,7 +452,7 @@ impl Service {
         lease_minutes: i64,
     ) -> Result<Claim, ApplicationError> {
         let effort = self.active_effort(effort).await?;
-        self.store.reap_expired_claims(&effort.id, &now()).await?;
+        self.store.reap_expired_claims(&effort.id).await?;
         let graph = self.store.snapshot(&effort.id).await?;
         let timestamp = now();
         let frontier = calculate_frontier(&graph, &timestamp);
@@ -1540,7 +1540,7 @@ mod tests {
             .unwrap();
         let node = add_test_node(&service, &effort.slug, NodeKind::Action, "owned").await;
         let claim = service
-            .claim_node(&effort.slug, &node.id, "openai-codex", 30)
+            .claim_node(&effort.slug, &node.id, "openai-codex", 120)
             .await
             .unwrap();
 
@@ -1571,10 +1571,11 @@ mod tests {
                 .await,
             Err(ApplicationError::Store(StoreError::ClaimNotOwned(_)))
         ));
-        service
+        let heartbeat = service
             .heartbeat_claim(&claim.id, "openai-codex", 30)
             .await
             .unwrap();
+        assert_eq!(heartbeat.lease_expires_at, claim.lease_expires_at);
         assert!(matches!(
             service
                 .resolve_claimed_node(
