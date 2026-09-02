@@ -77,7 +77,7 @@ impl Store {
     }
 
     pub async fn reconcile_workspace(&self, workspace: &Workspace) -> Result<(), StoreError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let root_match = sqlx::query("SELECT * FROM workspaces WHERE root_uri = ?")
             .bind(&workspace.root_uri)
             .fetch_optional(&mut *tx)
@@ -910,4 +910,46 @@ fn parse_optional_json(
     value: Option<String>,
 ) -> Result<Option<Value>, StoreError> {
     value.map(|value| parse_json(field, value)).transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+    use threadmark_domain::Workspace;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn reconciles_concurrent_first_opens() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let first = Store::connect(&path).await.unwrap();
+        let second = Store::connect(&path).await.unwrap();
+        let workspace = |root_uri: &str| Workspace {
+            id: "01TESTWORKSPACE000000000000".into(),
+            name: "test".into(),
+            root_uri: root_uri.into(),
+            schema_version: 1,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+
+        let first_workspace = workspace("first-worktree");
+        let second_workspace = workspace("second-worktree");
+        let (first_result, second_result) = tokio::join!(
+            first.reconcile_workspace(&first_workspace),
+            second.reconcile_workspace(&second_workspace),
+        );
+
+        first_result.unwrap();
+        second_result.unwrap();
+        assert_eq!(
+            first
+                .get_workspace("01TESTWORKSPACE000000000000")
+                .await
+                .unwrap()
+                .id,
+            "01TESTWORKSPACE000000000000"
+        );
+    }
 }
