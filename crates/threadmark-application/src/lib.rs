@@ -673,6 +673,7 @@ impl Service {
         claim_guard: ClaimGuard<'_>,
     ) -> Result<(Node, i64), ApplicationError> {
         let effort = self.active_effort(effort).await?;
+        self.store.reap_expired_claims(&effort.id).await?;
         let expected = expected_version.unwrap_or(effort.version);
         let mut node = self.store.get_node(&effort.id, selector).await?;
         let before = serde_json::to_value(&node)?;
@@ -1293,6 +1294,38 @@ mod tests {
             .0
     }
 
+    async fn insert_expired_claim(service: &Service, effort: &Effort, node: &Node) {
+        let timestamp = now();
+        let claim = Claim {
+            id: id(),
+            node_id: node.id.clone(),
+            actor_id: "test".into(),
+            claimant: "test".into(),
+            claimed_at: timestamp.clone(),
+            heartbeat_at: timestamp.clone(),
+            lease_expires_at: "2020-01-01T00:00:00Z".into(),
+            released_at: None,
+            release_reason: None,
+        };
+        let audit = event(
+            Some(&effort.id),
+            "test",
+            None,
+            "claim_acquired",
+            "claim",
+            &claim.id,
+            None,
+            None,
+            None,
+            &timestamp,
+        );
+        service
+            .store
+            .insert_claim(&claim, &timestamp, &audit)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn creates_effort_and_frontier_node() {
         let directory = TempDir::new().unwrap();
@@ -1387,39 +1420,54 @@ mod tests {
             .await
             .unwrap();
         let node = add_test_node(&service, &effort.slug, NodeKind::Action, "expired").await;
-        let timestamp = now();
-        let claim = Claim {
-            id: id(),
-            node_id: node.id.clone(),
-            actor_id: "test".into(),
-            claimant: "test".into(),
-            claimed_at: timestamp.clone(),
-            heartbeat_at: timestamp.clone(),
-            lease_expires_at: "2020-01-01T00:00:00Z".into(),
-            released_at: None,
-            release_reason: None,
-        };
-        let audit = event(
-            Some(&effort.id),
-            "test",
-            None,
-            "claim_acquired",
-            "claim",
-            &claim.id,
-            None,
-            None,
-            None,
-            &timestamp,
-        );
-        service
-            .store
-            .insert_claim(&claim, &timestamp, &audit)
-            .await
-            .unwrap();
+        insert_expired_claim(&service, &effort, &node).await;
 
         let (_, graph) = service.snapshot(&effort.slug).await.unwrap();
 
         assert_eq!(graph.nodes[0].lifecycle, Lifecycle::Open);
+        assert!(
+            service
+                .effort_history(&effort.slug)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| event.event_type == "claim_expired")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolving_after_a_lease_expiry_records_the_expiration() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = service
+            .create_effort(CreateEffort {
+                slug: "resolve".into(),
+                title: "Resolve".into(),
+                destination: "Test expiration before resolution".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        let node = add_test_node(&service, &effort.slug, NodeKind::Action, "expired").await;
+        insert_expired_claim(&service, &effort, &node).await;
+
+        service
+            .resolve_node(
+                &effort.slug,
+                &node.id,
+                "test",
+                None,
+                "resolved".into(),
+                None,
+                None,
+                None,
+                "resolved",
+                None,
+            )
+            .await
+            .unwrap();
+
         assert!(
             service
                 .effort_history(&effort.slug)

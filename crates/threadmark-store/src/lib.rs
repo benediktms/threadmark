@@ -13,7 +13,9 @@ use threadmark_domain::{
     GraphSnapshot, Lifecycle, Node, NodeRevision, Reversibility, RiskLevel, Source, Uncertainty,
     Workspace,
 };
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{
+    Duration as TimeDuration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339,
+};
 use ulid::Ulid;
 
 #[derive(Debug, Error)]
@@ -830,6 +832,8 @@ impl Store {
             .as_deref()
             .map(parse_timestamp)
             .transpose()?;
+        let occurred_from_candidate = occurred_from.and_then(|value| time_candidate(value, -1));
+        let occurred_to_candidate = occurred_to.and_then(|value| time_candidate(value, 1));
         let mut query = QueryBuilder::<Sqlite>::new(
             "SELECT events.* FROM events JOIN efforts ON efforts.id=events.effort_id \
              WHERE efforts.workspace_id=",
@@ -849,6 +853,12 @@ impl Store {
         }
         if let Some(value) = &filter.event_type {
             query.push(" AND events.event_type=").push_bind(value);
+        }
+        if let Some(value) = &occurred_from_candidate {
+            query.push(" AND events.occurred_at>").push_bind(value);
+        }
+        if let Some(value) = &occurred_to_candidate {
+            query.push(" AND events.occurred_at<").push_bind(value);
         }
         let rows = query
             .push(" ORDER BY events.occurred_at,events.id")
@@ -1122,6 +1132,18 @@ fn parse_optional_json(
 
 fn parse_timestamp(value: &str) -> Result<OffsetDateTime, StoreError> {
     OffsetDateTime::parse(value, &Rfc3339).map_err(|_| StoreError::InvalidTimestamp(value.into()))
+}
+
+fn time_candidate(value: OffsetDateTime, seconds: i64) -> Option<String> {
+    let value = value
+        .to_offset(UtcOffset::UTC)
+        .checked_add(TimeDuration::seconds(seconds))?;
+    Some(
+        OffsetDateTime::from_unix_timestamp(value.unix_timestamp())
+            .expect("parsed timestamp is within the Unix timestamp range")
+            .format(&Rfc3339)
+            .expect("RFC 3339 formatting succeeds"),
+    )
 }
 
 #[cfg(test)]
