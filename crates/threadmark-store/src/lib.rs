@@ -273,6 +273,38 @@ impl Store {
         Ok(version)
     }
 
+    pub async fn reopen_effort(
+        &self,
+        effort: &Effort,
+        event: &AuditEvent,
+        expected_version: i64,
+    ) -> Result<i64, StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query("SELECT version,status FROM efforts WHERE id=?")
+            .bind(&effort.id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        let actual: i64 = row.get("version");
+        if actual != expected_version {
+            return Err(StoreError::VersionConflict {
+                expected: expected_version,
+                actual,
+            });
+        }
+        if row.get::<String, _>("status") != "completed" {
+            return Err(StoreError::EffortInactive);
+        }
+        sqlx::query("UPDATE efforts SET status='active' WHERE id=?")
+            .bind(&effort.id)
+            .execute(&mut *tx)
+            .await?;
+        insert_event(&mut tx, event).await?;
+        let version = bump_version(&mut tx, &effort.id, &effort.updated_at).await?;
+        tx.commit().await?;
+        Ok(version)
+    }
+
     pub async fn list_efforts(&self, workspace_id: &str) -> Result<Vec<Effort>, StoreError> {
         let rows = sqlx::query("SELECT * FROM efforts WHERE workspace_id = ? ORDER BY created_at")
             .bind(workspace_id)

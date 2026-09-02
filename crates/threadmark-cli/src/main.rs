@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::{Value, json};
-use threadmark_application::{AddEdge, AddNode, CreateEffort, Service};
+use threadmark_application::{AddEdge, AddNode, CreateEffort, ReopenEffort, Service};
 use threadmark_domain::{
     Confidence, EdgeType, Lifecycle, NewEdge, NewNode, NodeKind, Reversibility, RiskLevel,
     SourceKind, SourceTrust, Uncertainty, Validity,
@@ -138,6 +138,15 @@ enum EffortCommand {
         effort: String,
         #[arg(long, default_value = "human")]
         actor: String,
+        #[arg(long)]
+        expected_version: Option<i64>,
+    },
+    Reopen {
+        effort: String,
+        #[arg(long, default_value = "human")]
+        actor: String,
+        #[arg(long)]
+        reason: String,
         #[arg(long)]
         expected_version: Option<i64>,
     },
@@ -449,6 +458,24 @@ async fn dispatch(service: &Service, command: Command, json_output: bool) -> Res
                     .await?;
                 output(json_output, &effort, || {
                     format!("Completed effort {} ({})", effort.title, effort.id)
+                })
+            }
+            EffortCommand::Reopen {
+                effort,
+                actor,
+                reason,
+                expected_version,
+            } => {
+                let effort = service
+                    .reopen_effort(ReopenEffort {
+                        effort,
+                        actor_id: actor,
+                        reason,
+                        expected_version,
+                    })
+                    .await?;
+                output(json_output, &effort, || {
+                    format!("Reopened effort {} ({})", effort.title, effort.id)
                 })
             }
             EffortCommand::Show { effort } => {
