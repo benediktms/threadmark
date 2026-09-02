@@ -446,6 +446,17 @@ impl Store {
     pub async fn reap_expired_claims(&self, effort_id: &str, now: &str) -> Result<(), StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
+            "UPDATE nodes SET lifecycle='open',updated_at=? \
+             WHERE effort_id=? AND lifecycle='in_progress' \
+             AND id IN (SELECT node_id FROM claims \
+                        WHERE released_at IS NULL AND lease_expires_at<=?)",
+        )
+        .bind(now)
+        .bind(effort_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
             "UPDATE claims SET released_at=?,release_reason='lease expired' \
              WHERE released_at IS NULL AND lease_expires_at<=? \
              AND node_id IN (SELECT id FROM nodes WHERE effort_id=?)",
@@ -453,17 +464,6 @@ impl Store {
         .bind(now)
         .bind(now)
         .bind(effort_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE nodes SET lifecycle='open',updated_at=? \
-             WHERE effort_id=? AND lifecycle='in_progress' \
-             AND NOT EXISTS (SELECT 1 FROM claims WHERE claims.node_id=nodes.id \
-                             AND claims.released_at IS NULL AND claims.lease_expires_at>?)",
-        )
-        .bind(now)
-        .bind(effort_id)
-        .bind(now)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1159,5 +1159,77 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(released_at.as_deref(), Some("now"));
+    }
+
+    #[tokio::test]
+    async fn reaping_does_not_reopen_an_unclaimed_node() {
+        let directory = TempDir::new().unwrap();
+        let store = Store::connect(&directory.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces(id,name,root_uri,schema_version,created_at,updated_at) VALUES('workspace','test','test',1,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO efforts(id,workspace_id,slug,title,destination,status,version,created_at,updated_at) VALUES('effort','workspace','test','test','test','active',1,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO nodes(id,effort_id,kind,title,lifecycle,validity,current_revision,created_at,updated_at) VALUES('node','effort','action','test','in_progress','current',0,'then','then')")
+            .execute(&store.pool).await.unwrap();
+
+        store.reap_expired_claims("effort", "now").await.unwrap();
+
+        let row = sqlx::query("SELECT lifecycle,updated_at FROM nodes WHERE id='node'")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("lifecycle"), "in_progress");
+        assert_eq!(row.get::<String, _>("updated_at"), "then");
+    }
+
+    #[tokio::test]
+    async fn claimant_migration_retires_legacy_claims_and_reopens_their_nodes() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE nodes (id TEXT PRIMARY KEY, lifecycle TEXT NOT NULL, updated_at TEXT NOT NULL); \
+             CREATE TABLE claims (id TEXT PRIMARY KEY, node_id TEXT NOT NULL, session_id TEXT NOT NULL, lease_expires_at TEXT NOT NULL, released_at TEXT, release_reason TEXT); \
+             INSERT INTO nodes VALUES ('claimed','in_progress','then'),('unclaimed','in_progress','then'),('released','in_progress','then'); \
+             INSERT INTO claims VALUES ('active','claimed','session','future',NULL,NULL),('old','released','session','past','past','done');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(include_str!("../migrations/0002_claimant.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let nodes: Vec<(String, String)> =
+            sqlx::query_as("SELECT id,lifecycle FROM nodes ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            nodes,
+            vec![
+                ("claimed".into(), "open".into()),
+                ("released".into(), "in_progress".into()),
+                ("unclaimed".into(), "in_progress".into()),
+            ]
+        );
+        let active: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT released_at,release_reason FROM claims WHERE id='active'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(active.0.is_some());
+        assert_eq!(active.1.as_deref(), Some("claimant migration"));
+        let claimant: String = sqlx::query_scalar("SELECT claimant FROM claims WHERE id='active'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(claimant, "session");
     }
 }
