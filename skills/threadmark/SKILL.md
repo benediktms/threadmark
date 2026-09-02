@@ -1,6 +1,6 @@
 ---
 name: threadmark
-description: Use a Threadmark reasoning graph to chart uncertain work, resolve its current frontier, reconcile invalidated decisions, or produce a specification handoff. Applies when a project has a .threadmark workspace or the user explicitly asks to use Threadmark; it is not an implementation task tracker.
+description: Use a Threadmark reasoning graph to chart uncertain work, resolve its current frontier, reconcile invalidated decisions, or split a scoped effort into implementation tickets. Applies when a project has a .threadmark workspace or the user explicitly asks to use Threadmark; it is not an implementation task tracker.
 ---
 
 # Threadmark
@@ -34,6 +34,7 @@ Orient
   -> Work       when the user explicitly authorizes resolving a frontier node
   -> Reconcile  when a premise, decision, or review finding is challenged
   -> Verify     when the frontier is empty or a handoff is requested
+  -> Split      when readiness passes and the user approves ticket splitting
   -> Stop       when the effort is completed, blocked on a human, or MCP lacks
                 the transition needed to preserve the graph
 ```
@@ -102,15 +103,42 @@ Inspect the challenged premise, decision, or review-required descendant. Read
 invalidation, and commit only the reviewed propagation. Then return to
 **Work** for reopened nodes or **Verify** when no work remains.
 
-### Verify and hand off
+### Verify
 
 Run lint and readiness after every mutation and before completion. A failed check
 chooses the next state: open node -> **Work**; active fog -> **Reduce fog**;
 challenged or review-required conclusion -> **Reconcile**; human decision ->
-**Stop**. When all required checks pass, complete the effort through
-`threadmark_complete_effort`. If the user requests a handoff, use an MCP handoff
-tool when one is available; otherwise enter **Stop** and report that capability
-gap. Stop at the specification boundary unless execution is explicitly in scope.
+**Stop**. When all required checks pass and implementation work remains, ask the
+user whether they want it split into tickets, then stop. Enter **Split** only
+after explicit approval. If they decline, or the destination was the completed
+work itself, complete the effort through `threadmark_complete_effort` and stop.
+
+### Split implementation tickets
+
+Turn the converged effort into a proposed implementation-ticket split. This is a
+handoff to the configured tracker, not a new Threadmark graph or an execution DAG.
+
+1. Load the resolved decisions, constraints, scope, and dependency order needed
+   for implementation. Use an MCP handoff tool when one is available; otherwise
+   fetch the relevant nodes through MCP.
+2. Search the tracker for existing work before proposing new tickets. Reuse or
+   relate matching work instead of duplicating it.
+3. Split by independently implementable, reviewable outcomes in delivery order.
+   Do not create one ticket per reasoning node: several decisions may collapse
+   into one ticket, and one decision may require several tickets. Preserve real
+   blocking relationships; add a parent only when it makes a large batch clearer.
+4. Make every ticket standalone for a teammate who has never seen Threadmark.
+   State what is missing, why it matters, the intended outcome, acceptance
+   criteria, relevant system boundaries, and explicit exclusions. Do not include
+   Threadmark node IDs or other local-only references in tracker content.
+5. Present the proposed split and dependency order to the user. Create, relate,
+   or publish tickets only after explicit approval, following the repository's
+   tracker instructions.
+6. After the approved handoff is filed, complete the effort through
+   `threadmark_complete_effort`. If the user declines tracker mutation, complete
+   it only when they explicitly accept the proposed split as the handoff.
+
+Stop at the ticket boundary unless execution is explicitly in scope.
 
 ## Invariants
 
