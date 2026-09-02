@@ -79,7 +79,7 @@ pub fn calculate_frontier(graph: &GraphSnapshot, now: &str) -> Vec<FrontierEntry
         .iter()
         .filter(|node| node.claimable())
         .filter(|node| node.lifecycle == Lifecycle::Open)
-        .filter(|node| node.usable())
+        .filter(|node| node.usable() || node.validity == Validity::ReviewRequired)
         .filter(|node| !claimed.contains(node.id.as_str()))
         .filter(|node| {
             graph
@@ -448,6 +448,21 @@ mod tests {
         let frontier = calculate_frontier(&graph, "2026-01-01T00:00:00Z");
         assert_eq!(frontier.len(), 1);
         assert_eq!(frontier[0].node.id, "research");
+    }
+
+    #[test]
+    fn review_required_open_node_is_on_frontier() {
+        let mut question = node("question", NodeKind::Question, Lifecycle::Open);
+        question.validity = Validity::ReviewRequired;
+        let graph = GraphSnapshot {
+            nodes: vec![question],
+            ..GraphSnapshot::default()
+        };
+
+        let frontier = calculate_frontier(&graph, "2026-01-01T00:00:00Z");
+
+        assert_eq!(frontier.len(), 1);
+        assert_eq!(frontier[0].node.id, "question");
     }
 
     #[test]
