@@ -301,6 +301,9 @@ Source fields:
 - `trust`: `unreviewed | reviewed | authoritative`.
 
 Threadmark records provenance; it does not claim that a source is correct. Trust is assigned explicitly.
+Sources are effort-local: a node may only attach sources owned by the same effort.
+Existing cross-effort links remain readable for backward compatibility, but new
+links are rejected by both dedicated and batch attachment operations.
 
 ### 8.9 Fog patches
 
@@ -443,6 +446,7 @@ Threadmark distinguishes **suspected contradiction**, **accepted contradiction**
 4. Acceptance creates a `contradicts` edge and marks both current nodes `challenged` unless already in a stronger invalid state.
 5. A focused question or experiment should normally be created to reconcile the claims.
 6. Adjudication may reaffirm both claims with clarified scope, invalidate one claim, split a claim, or retain an unresolved contradiction.
+7. Resolving an accepted contradiction requires terminal endpoint states; any endpoint reaffirmation and the finding transition must share one atomic batch.
 
 The core never asks an LLM on its own. A host agent may use `threadmark contradiction candidates` or the MCP equivalent to fetch likely comparison sets, run its own analysis, and submit proposals.
 
@@ -983,7 +987,6 @@ and do not repeat the `threadmark_` prefix.
 - `explain_node`
 - `get_readiness`
 - `lint`
-- `get_findings`
 - `get_history`
 - `render_handoff`
 
@@ -1014,24 +1017,29 @@ Agents should normally submit one atomic change set after completing an investig
 
 ```json
 {
-  "effort_id": "...",
+  "effort": "...",
   "expected_effort_version": 17,
   "actor_id": "codex",
   "session_id": "session-...",
-  "claim_id": "...",
   "operations": [
-    {"op": "add_source", "temp_id": "s1", "value": {}},
-    {"op": "add_evidence", "temp_id": "e1", "value": {}},
-    {"op": "attach_source", "node": "e1", "source": "s1"},
-    {"op": "resolve_node", "node": "Q1", "answer": "..."},
+    {"op": "add_source", "temp_id": "s1", "kind": "url", "title": "Benchmark", "uri": "https://example.com"},
+    {"op": "add_node", "temp_id": "e1", "value": {"kind": "evidence", "title": "Benchmark result", "summary": "...", "body": "...", "payload": {}, "lifecycle": "resolved"}},
+    {"op": "attach_source", "node": "e1", "source": "s1", "relationship": "supports"},
+    {"op": "resolve_node", "node": "Q1", "body": "...", "reason": "Investigation complete"},
     {"op": "add_edge", "source": "e1", "type": "resolves", "target": "Q1"},
-    {"op": "add_question", "temp_id": "q2", "value": {}},
+    {"op": "add_node", "temp_id": "q2", "value": {"kind": "question", "title": "Follow-up", "summary": "...", "body": "", "payload": {}, "lifecycle": "open"}},
     {"op": "graduate_fog", "fog": "F3", "to": ["q2"]}
   ]
 }
 ```
 
 The server validates the entire batch and either commits all operations or none. Temporary IDs are resolved within the batch. The response includes the new effort version, stable IDs, changed frontier, findings, and readiness delta.
+
+The v1 batch accepts node and edge creation, source creation and attachment, node
+resolution, fog graduation, and contradiction proposal or adjudication. Claims,
+effort lifecycle, and invalidation remain dedicated operations because they have
+separate concurrency or preview contracts. Findings are read through
+`get_snapshot` with the `findings` section rather than a duplicate list tool.
 
 ### 23.5 Context response budget
 
