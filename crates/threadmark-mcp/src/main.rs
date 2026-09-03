@@ -2,11 +2,16 @@ use std::{env, path::PathBuf, str::FromStr};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use threadmark_application::{AddEdge, AddNode, ReopenEffort, Service};
-use threadmark_domain::{
-    Confidence, EdgeType, Lifecycle, NewEdge, NewNode, NodeKind, SourceKind, SourceTrust, Validity,
+use threadmark_application::{
+    AddEdge, AddNode, CreateEffort, EventCursor, EventPage, Pagination, ReopenEffort, Service,
 };
+use threadmark_domain::{
+    Confidence, EdgeType, EventFilter, GraphSnapshot, Lifecycle, NewEdge, NewNode, NodeKind,
+    RiskLevel, SourceKind, SourceTrust, Validity,
+};
+use threadmark_export::{PortableEffort, render_handoff_section};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing_subscriber::EnvFilter;
 
@@ -15,6 +20,27 @@ use tracing_subscriber::EnvFilter;
 struct Args {
     #[arg(long)]
     workspace: PathBuf,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct SnapshotBoundary {
+    version: i64,
+    event_rowid: i64,
+    claims_version: i64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SnapshotCursor {
+    #[serde(flatten)]
+    boundary: SnapshotBoundary,
+    section: String,
+    offset: u32,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RevisionCursor {
+    node_id: String,
+    offset: u32,
 }
 
 #[tokio::main]
@@ -26,7 +52,7 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
-    let service = Service::open(&args.workspace).await?;
+    let service = Service::open_or_init(&args.workspace).await?;
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
     let mut stdout = tokio::io::stdout();
@@ -94,6 +120,21 @@ async fn handle(service: &Service, request: &Value) -> Value {
 
 async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value> {
     match name {
+        "threadmark_create_effort" => Ok(serde_json::to_value(
+            service
+                .create_effort(CreateEffort {
+                    slug: required(args, "slug")?.into(),
+                    title: required(args, "title")?.into(),
+                    destination: required(args, "destination")?.into(),
+                    scope_notes: args
+                        .get("scope_notes")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .into(),
+                    actor_id: required(args, "actor_id")?.into(),
+                })
+                .await?,
+        )?),
         "threadmark_list_efforts" => Ok(json!({"efforts": service.list_efforts().await?})),
         "threadmark_complete_effort" => Ok(serde_json::to_value(
             service
@@ -117,6 +158,52 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
         "threadmark_get_context" => {
             let effort = required(args, "effort")?;
             Ok(serde_json::to_value(service.status(effort).await?)?)
+        }
+        "threadmark_get_snapshot" => {
+            let section = required(args, "section")?;
+            let (effort, items, next_cursor, boundary) =
+                snapshot_section_page(service, args, section).await?;
+            Ok(
+                json!({"effort":effort,"section":section,"items":items,"snapshot":serde_json::to_string(&boundary)?,"next_cursor":next_cursor}),
+            )
+        }
+        "threadmark_get_history" => {
+            let effort = required(args, "effort")?;
+            if let Some(selector) = args.get("node").and_then(Value::as_str) {
+                let node = service.get_node(effort, selector).await?;
+                let page = revision_page(args, &node.id)?;
+                let (revisions, next) = service.node_history_page(effort, &node.id, page).await?;
+                let next_cursor = next
+                    .map(|offset| {
+                        serde_json::to_string(&RevisionCursor {
+                            node_id: node.id.clone(),
+                            offset,
+                        })
+                    })
+                    .transpose()?;
+                Ok(json!({"revisions":revisions,"next_cursor":next_cursor}))
+            } else {
+                let page = event_page(args)?;
+                let (events, next) = service
+                    .effort_history_page(
+                        effort,
+                        EventFilter {
+                            entity_type: optional_string(args, "entity_type"),
+                            entity_id: optional_string(args, "entity_id"),
+                            actor_id: optional_string(args, "actor_id"),
+                            event_type: optional_string(args, "event_type"),
+                            occurred_from: optional_string(args, "occurred_from"),
+                            occurred_to: optional_string(args, "occurred_to"),
+                            ..EventFilter::default()
+                        },
+                        page,
+                    )
+                    .await?;
+                let next_cursor = next
+                    .map(|cursor| serde_json::to_string(&cursor))
+                    .transpose()?;
+                Ok(json!({"events":events,"next_cursor":next_cursor}))
+            }
         }
         "threadmark_get_frontier" => {
             let status = service.status(required(args, "effort")?).await?;
@@ -227,6 +314,34 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                 .await?;
             Ok(json!({"criterion":criterion,"effort_version":version}))
         }
+        "threadmark_add_fog" => {
+            let (fog, version) = service
+                .add_fog(
+                    required(args, "effort")?,
+                    required(args, "title")?.into(),
+                    required(args, "description")?.into(),
+                    args.get("anchor").and_then(Value::as_str).map(Into::into),
+                    required(args, "actor_id")?,
+                    Some(required_i64(args, "expected_version")?),
+                )
+                .await?;
+            Ok(json!({"fog":fog,"effort_version":version}))
+        }
+        "threadmark_graduate_fog" => {
+            let targets = required_strings(args, "to")?;
+            let (targets, version) = service
+                .graduate_fog(
+                    required(args, "effort")?,
+                    required(args, "fog")?,
+                    &targets,
+                    required(args, "actor_id")?,
+                    Some(required_i64(args, "expected_version")?),
+                )
+                .await?;
+            Ok(
+                json!({"fog":required(args, "fog")?,"graduated_to":targets,"effort_version":version}),
+            )
+        }
         "threadmark_add_node" => {
             let effort = required(args, "effort")?;
             let kind = NodeKind::from_str(required(args, "kind")?).map_err(anyhow::Error::msg)?;
@@ -290,6 +405,22 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                 .await?;
             Ok(json!({"edge":edge,"effort_version":version}))
         }
+        "threadmark_propose_contradiction" => {
+            let severity =
+                parse_optional::<RiskLevel>(args, "severity")?.unwrap_or(RiskLevel::High);
+            let (finding, version) = service
+                .propose_contradiction(
+                    required(args, "effort")?,
+                    required(args, "left")?,
+                    required(args, "right")?,
+                    required(args, "detail")?.into(),
+                    severity,
+                    required(args, "actor_id")?,
+                    Some(required_i64(args, "expected_version")?),
+                )
+                .await?;
+            Ok(json!({"finding":finding,"effort_version":version}))
+        }
         "threadmark_resolve_node" => {
             let confidence = parse_optional::<Confidence>(args, "confidence")?;
             let (node, version) = service
@@ -349,12 +480,116 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                 .await?;
             Ok(json!({"preview":preview,"effort_version":version}))
         }
+        "threadmark_render_handoff" => render_handoff_page(service, args).await,
         _ => anyhow::bail!("unknown Threadmark tool: {name}"),
     }
 }
 
+async fn render_handoff_page(service: &Service, args: &Value) -> Result<Value> {
+    let section = required(args, "section")?;
+    let effort_selector = required(args, "effort")?;
+    let (effort, items, next_cursor, boundary) = if section == "overview" {
+        anyhow::ensure!(
+            args.get("cursor").is_none(),
+            "overview does not accept a cursor"
+        );
+        let (effort, _, _, event_rowid, claims_version) = service
+            .snapshot_section(
+                effort_selector,
+                "nodes",
+                Pagination {
+                    limit: 0,
+                    offset: 0,
+                },
+            )
+            .await?;
+        let boundary = SnapshotBoundary {
+            version: effort.version,
+            event_rowid,
+            claims_version,
+        };
+        (effort, vec![], None, boundary)
+    } else {
+        anyhow::ensure!(
+            args.get("snapshot").and_then(Value::as_str).is_some()
+                || args.get("cursor").and_then(Value::as_str).is_some(),
+            "handoff snapshot is required; load overview first"
+        );
+        snapshot_section_page(service, args, section).await?
+    };
+    let mut graph = GraphSnapshot::default();
+    match section {
+        "overview" => {}
+        "nodes" => graph.nodes = serde_json::from_value(Value::Array(items))?,
+        "findings" => graph.findings = serde_json::from_value(Value::Array(items))?,
+        "fog_patches" => graph.fog_patches = serde_json::from_value(Value::Array(items))?,
+        "edges" => graph.edges = serde_json::from_value(Value::Array(items))?,
+        _ => anyhow::bail!("unknown handoff section: {section}"),
+    }
+    let package = PortableEffort {
+        format_version: 1,
+        effort,
+        graph,
+        sources: vec![],
+        events: vec![],
+    };
+    Ok(json!({
+        "handoff": render_handoff_section(&package, section, false).expect("validated handoff section"),
+        "section": section,
+        "snapshot": serde_json::to_string(&boundary)?,
+        "next_cursor": next_cursor,
+    }))
+}
+
+async fn snapshot_section_page(
+    service: &Service,
+    args: &Value,
+    section: &str,
+) -> Result<(
+    threadmark_domain::Effort,
+    Vec<Value>,
+    Option<String>,
+    SnapshotBoundary,
+)> {
+    let (page, expected_snapshot) = snapshot_page(args, section)?;
+    let (effort, items, next_offset, event_rowid, claims_version) = service
+        .snapshot_section(required(args, "effort")?, section, page)
+        .await?;
+    if let Some(expected) = expected_snapshot {
+        anyhow::ensure!(
+            expected.version == effort.version
+                && expected.event_rowid == event_rowid
+                && expected.claims_version == claims_version,
+            "snapshot changed between pages"
+        );
+    }
+    let boundary = SnapshotBoundary {
+        version: effort.version,
+        event_rowid,
+        claims_version,
+    };
+    let next_cursor = next_offset
+        .map(|offset| {
+            serde_json::to_string(&SnapshotCursor {
+                boundary: boundary.clone(),
+                section: section.into(),
+                offset,
+            })
+        })
+        .transpose()?;
+    Ok((effort, items, next_cursor, boundary))
+}
+
 fn tool_definitions() -> Vec<Value> {
     vec![
+        tool(
+            "threadmark_create_effort",
+            "Create a reasoning effort",
+            object(
+                &["slug", "title", "destination", "actor_id"],
+                json!({"slug":{"type":"string"},"title":{"type":"string"},"destination":{"type":"string"},"scope_notes":{"type":"string"},"actor_id":{"type":"string"}}),
+            ),
+        ),
         tool(
             "threadmark_list_efforts",
             "List reasoning efforts",
@@ -380,6 +615,22 @@ fn tool_definitions() -> Vec<Value> {
             "threadmark_get_context",
             "Get low-resolution effort context, readiness, frontier, and findings",
             object(&["effort"], json!({"effort":{"type":"string"}})),
+        ),
+        tool(
+            "threadmark_get_snapshot",
+            "Get one version-bound page of a graph section",
+            object(
+                &["effort", "section"],
+                json!({"effort":{"type":"string"},"section":{"type":"string","enum":["nodes","edges","claims","fog_patches","findings","exit_criteria","node_sources","sources"]},"snapshot":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":"string"}}),
+            ),
+        ),
+        tool(
+            "threadmark_get_history",
+            "Get a filtered page of effort events or one node's revisions",
+            object(
+                &["effort"],
+                json!({"effort":{"type":"string"},"node":{"type":"string"},"entity_type":{"type":"string"},"entity_id":{"type":"string"},"actor_id":{"type":"string"},"event_type":{"type":"string"},"occurred_from":{"type":"string"},"occurred_to":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":"string"}}),
+            ),
         ),
         tool(
             "threadmark_get_frontier",
@@ -455,6 +706,28 @@ fn tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
+            "threadmark_add_fog",
+            "Record an active fog patch",
+            object(
+                &[
+                    "effort",
+                    "title",
+                    "description",
+                    "actor_id",
+                    "expected_version",
+                ],
+                json!({"effort":{"type":"string"},"title":{"type":"string"},"description":{"type":"string"},"anchor":{"type":"string"},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
+            ),
+        ),
+        tool(
+            "threadmark_graduate_fog",
+            "Graduate a fog patch to concrete nodes",
+            object(
+                &["effort", "fog", "to", "actor_id", "expected_version"],
+                json!({"effort":{"type":"string"},"fog":{"type":"string"},"to":{"type":"array","items":{"type":"string"},"minItems":1},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
+            ),
+        ),
+        tool(
             "threadmark_add_node",
             "Add a typed reasoning node",
             object(
@@ -468,6 +741,21 @@ fn tool_definitions() -> Vec<Value> {
             object(
                 &["effort", "source", "type", "target", "actor_id"],
                 json!({"effort":{"type":"string"},"source":{"type":"string"},"type":{"type":"string"},"target":{"type":"string"},"rationale":{"type":"string"},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
+            ),
+        ),
+        tool(
+            "threadmark_propose_contradiction",
+            "Propose a contradiction finding between two nodes",
+            object(
+                &[
+                    "effort",
+                    "left",
+                    "right",
+                    "detail",
+                    "actor_id",
+                    "expected_version",
+                ],
+                json!({"effort":{"type":"string"},"left":{"type":"string"},"right":{"type":"string"},"detail":{"type":"string"},"severity":{"type":"string"},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
             ),
         ),
         tool(
@@ -500,6 +788,14 @@ fn tool_definitions() -> Vec<Value> {
             object(
                 &["effort", "node", "actor_id", "reason"],
                 json!({"effort":{"type":"string"},"node":{"type":"string"},"target":{"type":"string"},"actor_id":{"type":"string"},"reason":{"type":"string"},"expected_version":{"type":"integer"}}),
+            ),
+        ),
+        tool(
+            "threadmark_render_handoff",
+            "Render one bounded handoff section; load overview first and pass its snapshot token to every other section",
+            object(
+                &["effort", "section"],
+                json!({"effort":{"type":"string"},"section":{"type":"string","enum":["overview","nodes","findings","fog_patches","edges"]},"snapshot":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":"string"}}),
             ),
         ),
     ]
@@ -558,6 +854,101 @@ fn required<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
         .with_context(|| format!("missing string argument: {key}"))
+}
+
+fn required_i64(args: &Value, key: &str) -> Result<i64> {
+    args.get(key)
+        .and_then(Value::as_i64)
+        .with_context(|| format!("missing integer argument: {key}"))
+}
+
+fn optional_string(args: &Value, key: &str) -> Option<String> {
+    args.get(key).and_then(Value::as_str).map(Into::into)
+}
+
+fn page_limit(args: &Value) -> Result<u32> {
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100);
+    anyhow::ensure!(
+        (1..=500).contains(&limit),
+        "limit must be between 1 and 500"
+    );
+    Ok(limit as u32)
+}
+
+fn revision_page(args: &Value, node_id: &str) -> Result<Pagination> {
+    let cursor = args
+        .get("cursor")
+        .and_then(Value::as_str)
+        .map(serde_json::from_str::<RevisionCursor>)
+        .transpose()
+        .context("invalid history cursor")?;
+    if let Some(cursor) = &cursor {
+        anyhow::ensure!(cursor.node_id == node_id, "history cursor node changed");
+    }
+    Ok(Pagination {
+        limit: page_limit(args)?,
+        offset: cursor.map_or(0, |cursor| cursor.offset),
+    })
+}
+
+fn event_page(args: &Value) -> Result<EventPage> {
+    let cursor = args
+        .get("cursor")
+        .and_then(Value::as_str)
+        .map(serde_json::from_str::<EventCursor>)
+        .transpose()
+        .context("invalid history cursor")?;
+    Ok(EventPage {
+        limit: page_limit(args)?,
+        cursor,
+    })
+}
+
+fn snapshot_page(args: &Value, section: &str) -> Result<(Pagination, Option<SnapshotBoundary>)> {
+    let cursor = args
+        .get("cursor")
+        .and_then(Value::as_str)
+        .map(serde_json::from_str::<SnapshotCursor>)
+        .transpose()
+        .context("invalid snapshot cursor")?;
+    if let Some(cursor) = cursor {
+        anyhow::ensure!(cursor.section == section, "snapshot cursor section changed");
+        Ok((
+            Pagination {
+                limit: page_limit(args)?,
+                offset: cursor.offset,
+            },
+            Some(cursor.boundary),
+        ))
+    } else {
+        let boundary = args
+            .get("snapshot")
+            .and_then(Value::as_str)
+            .map(serde_json::from_str::<SnapshotBoundary>)
+            .transpose()
+            .context("invalid snapshot boundary")?;
+        Ok((
+            Pagination {
+                limit: page_limit(args)?,
+                offset: 0,
+            },
+            boundary,
+        ))
+    }
+}
+
+fn required_strings(args: &Value, key: &str) -> Result<Vec<String>> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .with_context(|| format!("missing string array argument: {key}"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(Into::into)
+                .with_context(|| format!("invalid string array argument: {key}"))
+        })
+        .collect()
 }
 
 fn parse_optional<T>(args: &Value, key: &str) -> Result<Option<T>>
@@ -622,6 +1013,96 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn missing_workspace_is_initialized_at_the_git_root() {
+        let directory = TempDir::new().unwrap();
+        let repository = directory.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Threadmark Test",
+                    "-c",
+                    "user.email=threadmark@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    "initial",
+                ])
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let worktree = directory.path().join("worktree");
+        assert!(
+            std::process::Command::new("git")
+                .args(["worktree", "add", "--quiet", "--detach"])
+                .arg(&worktree)
+                .arg("HEAD")
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let child = repository.join("nested");
+        let worktree_child = worktree.join("nested");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::create_dir(&worktree_child).unwrap();
+
+        let (first, second) = tokio::join!(
+            Service::open_or_init(&child),
+            Service::open_or_init(&worktree_child)
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_eq!(first.root(), repository.canonicalize().unwrap());
+        assert_eq!(second.root(), worktree.canonicalize().unwrap());
+        assert_eq!(second.workspace().id, first.workspace().id);
+        first
+            .create_effort(CreateEffort {
+                slug: "shared".into(),
+                title: "Shared".into(),
+                destination: "Visible from both worktrees".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.list_efforts().await.unwrap().len(), 1);
+
+        let nested_root = repository.join("nested-workspace");
+        let nested = Service::init(&nested_root, "nested").await.unwrap();
+        assert_ne!(nested.workspace().id, first.workspace().id);
+        assert!(nested.list_efforts().await.unwrap().is_empty());
+        nested
+            .create_effort(CreateEffort {
+                slug: "nested".into(),
+                title: "Nested".into(),
+                destination: "Survives restart".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        let reopened = Service::open(&nested_root).await.unwrap();
+        assert_eq!(reopened.workspace().id, nested.workspace().id);
+        assert_eq!(reopened.list_efforts().await.unwrap().len(), 1);
+    }
+
     #[test]
     fn requires_an_explicit_workspace() {
         assert!(Args::try_parse_from(["threadmark-mcp"]).is_err());
@@ -658,6 +1139,371 @@ mod tests {
             let result = tool_result(call_tool(&service, tool, &args).await.unwrap(), false);
             assert!(result["structuredContent"].is_object());
             assert!(result["structuredContent"][field].is_array());
+        }
+    }
+
+    #[tokio::test]
+    async fn exposes_existing_agent_workflows_through_mcp() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        let effort = call_tool(
+            &service,
+            "threadmark_create_effort",
+            &json!({
+                "slug": "parity",
+                "title": "MCP parity",
+                "destination": "Expose existing workflows",
+                "actor_id": "agent",
+            }),
+        )
+        .await
+        .unwrap();
+        let first = call_tool(
+            &service,
+            "threadmark_add_node",
+            &json!({
+                "effort": "parity",
+                "kind": "question",
+                "title": "First",
+                "actor_id": "agent",
+                "expected_version": 1,
+            }),
+        )
+        .await
+        .unwrap();
+        let second = call_tool(
+            &service,
+            "threadmark_add_node",
+            &json!({
+                "effort": "parity",
+                "kind": "question",
+                "title": "Second",
+                "actor_id": "agent",
+                "expected_version": 2,
+            }),
+        )
+        .await
+        .unwrap();
+        let fog = call_tool(
+            &service,
+            "threadmark_add_fog",
+            &json!({
+                "effort": "parity",
+                "title": "Unknown boundary",
+                "description": "Needs a concrete question",
+                "anchor": first["node"]["id"],
+                "actor_id": "agent",
+                "expected_version": 3,
+            }),
+        )
+        .await
+        .unwrap();
+        let second_selector = second["node"]["id"].as_str().unwrap()[..20].to_owned();
+        let graduated = call_tool(
+            &service,
+            "threadmark_graduate_fog",
+            &json!({
+                "effort": "parity",
+                "fog": fog["fog"]["id"],
+                "to": [second_selector],
+                "actor_id": "agent",
+                "expected_version": 4,
+            }),
+        )
+        .await
+        .unwrap();
+        call_tool(
+            &service,
+            "threadmark_propose_contradiction",
+            &json!({
+                "effort": "parity",
+                "left": first["node"]["id"],
+                "right": second["node"]["id"],
+                "detail": "The answers may conflict",
+                "actor_id": "agent",
+                "expected_version": 5,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let snapshot_nodes = call_tool(
+            &service,
+            "threadmark_get_snapshot",
+            &json!({"effort": "parity", "section": "nodes", "limit": 1}),
+        )
+        .await
+        .unwrap();
+        let snapshot_nodes_next = call_tool(
+            &service,
+            "threadmark_get_snapshot",
+            &json!({"effort": "parity", "section": "nodes", "limit": 1, "cursor": snapshot_nodes["next_cursor"]}),
+        )
+        .await
+        .unwrap();
+        let third = call_tool(
+            &service,
+            "threadmark_add_node",
+            &json!({
+                "effort": "parity",
+                "kind": "evidence",
+                "title": "Changed after the snapshot page",
+                "actor_id": "agent",
+                "expected_version": 6,
+            }),
+        )
+        .await
+        .unwrap();
+        let source = call_tool(
+            &service,
+            "threadmark_add_source",
+            &json!({
+                "effort": "parity",
+                "kind": "url",
+                "title": "Review source",
+                "uri": "https://example.com/source",
+                "actor_id": "agent",
+                "expected_version": 7,
+            }),
+        )
+        .await
+        .unwrap();
+        call_tool(
+            &service,
+            "threadmark_attach_source",
+            &json!({
+                "effort": "parity",
+                "node": first["node"]["id"],
+                "source": source["source"]["id"],
+                "relationship": "supports",
+                "actor_id": "agent",
+                "expected_version": 8,
+            }),
+        )
+        .await
+        .unwrap();
+        call_tool(
+            &service,
+            "threadmark_attach_source",
+            &json!({
+                "effort": "parity",
+                "node": first["node"]["id"],
+                "source": source["source"]["id"],
+                "relationship": "contradicts",
+                "actor_id": "agent",
+                "expected_version": 9,
+            }),
+        )
+        .await
+        .unwrap();
+        call_tool(
+            &service,
+            "threadmark_resolve_node",
+            &json!({
+                "effort": "parity",
+                "node": third["node"]["id"],
+                "body": "Resolved evidence",
+                "expected_version": 10,
+            }),
+        )
+        .await
+        .unwrap();
+        let stale_snapshot = call_tool(
+            &service,
+            "threadmark_get_snapshot",
+            &json!({"effort": "parity", "section": "nodes", "limit": 1, "cursor": snapshot_nodes["next_cursor"]}),
+        )
+        .await;
+        let snapshot_fog = call_tool(
+            &service,
+            "threadmark_get_snapshot",
+            &json!({"effort": "parity", "section": "fog_patches"}),
+        )
+        .await
+        .unwrap();
+        let snapshot_findings = call_tool(
+            &service,
+            "threadmark_get_snapshot",
+            &json!({"effort": "parity", "section": "findings"}),
+        )
+        .await
+        .unwrap();
+        let snapshot_node_sources = call_tool(
+            &service,
+            "threadmark_get_snapshot",
+            &json!({"effort": "parity", "section": "node_sources"}),
+        )
+        .await
+        .unwrap();
+        let effort_history = call_tool(
+            &service,
+            "threadmark_get_history",
+            &json!({"effort": "parity", "limit": 2}),
+        )
+        .await
+        .unwrap();
+        let effort_history_next = call_tool(
+            &service,
+            "threadmark_get_history",
+            &json!({
+                "effort": "parity",
+                "limit": 2,
+                "cursor": effort_history["next_cursor"],
+            }),
+        )
+        .await
+        .unwrap();
+        let filtered_history = call_tool(
+            &service,
+            "threadmark_get_history",
+            &json!({"effort": "parity", "event_type": "effort_created"}),
+        )
+        .await
+        .unwrap();
+        let node_history = call_tool(
+            &service,
+            "threadmark_get_history",
+            &json!({"effort": "parity", "node": third["node"]["id"], "limit": 1}),
+        )
+        .await
+        .unwrap();
+        let mismatched_node_history = call_tool(
+            &service,
+            "threadmark_get_history",
+            &json!({"effort": "parity", "node": second["node"]["id"], "limit": 1, "cursor": node_history["next_cursor"]}),
+        )
+        .await;
+        let handoff_overview = call_tool(
+            &service,
+            "threadmark_render_handoff",
+            &json!({"effort": "parity", "section": "overview"}),
+        )
+        .await
+        .unwrap();
+        let handoff = call_tool(
+            &service,
+            "threadmark_render_handoff",
+            &json!({"effort": "parity", "section": "nodes", "limit": 1, "snapshot": handoff_overview["snapshot"]}),
+        )
+        .await
+        .unwrap();
+        let handoff_next = call_tool(
+            &service,
+            "threadmark_render_handoff",
+            &json!({"effort": "parity", "section": "nodes", "limit": 1, "cursor": handoff["next_cursor"]}),
+        )
+        .await
+        .unwrap();
+        let claimant = harness_claimant();
+        let first_claim = service
+            .claim_node(
+                "parity",
+                first["node"]["id"].as_str().unwrap(),
+                &claimant,
+                30,
+            )
+            .await
+            .unwrap();
+        service
+            .claim_node(
+                "parity",
+                second["node"]["id"].as_str().unwrap(),
+                &claimant,
+                30,
+            )
+            .await
+            .unwrap();
+        let claims = call_tool(
+            &service,
+            "threadmark_get_snapshot",
+            &json!({"effort": "parity", "section": "claims", "limit": 1}),
+        )
+        .await
+        .unwrap();
+        service
+            .heartbeat_claim(&first_claim.id, &claimant, 30)
+            .await
+            .unwrap();
+        let stale_claims = call_tool(
+            &service,
+            "threadmark_get_snapshot",
+            &json!({"effort": "parity", "section": "claims", "limit": 1, "cursor": claims["next_cursor"]}),
+        )
+        .await;
+        let stale_handoff_section = call_tool(
+            &service,
+            "threadmark_render_handoff",
+            &json!({"effort": "parity", "section": "findings", "snapshot": handoff_overview["snapshot"]}),
+        )
+        .await;
+
+        assert_eq!(effort["status"], "active");
+        assert_eq!(snapshot_nodes["items"].as_array().unwrap().len(), 1);
+        assert!(snapshot_nodes["next_cursor"].is_string());
+        assert_eq!(snapshot_nodes_next["items"].as_array().unwrap().len(), 1);
+        assert!(stale_snapshot.is_err());
+        assert_eq!(snapshot_fog["items"][0]["status"], "graduated");
+        assert_eq!(graduated["graduated_to"], json!([second["node"]["id"]]));
+        assert_eq!(snapshot_findings["items"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            snapshot_node_sources["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["relationship"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["contradicts", "supports"]
+        );
+        assert_eq!(effort_history["events"].as_array().unwrap().len(), 2);
+        assert!(effort_history["next_cursor"].is_string());
+        assert_eq!(effort_history_next["events"].as_array().unwrap().len(), 2);
+        assert_eq!(filtered_history["events"].as_array().unwrap().len(), 1);
+        assert_eq!(node_history["revisions"].as_array().unwrap().len(), 1);
+        assert!(node_history["next_cursor"].is_string());
+        assert!(mismatched_node_history.is_err());
+        assert!(handoff["handoff"].as_str().unwrap().contains("First"));
+        assert!(!handoff["handoff"].as_str().unwrap().contains("Second"));
+        assert!(
+            !handoff["handoff"]
+                .as_str()
+                .unwrap()
+                .contains("None recorded")
+        );
+        assert!(handoff["next_cursor"].is_string());
+        assert!(handoff_next["handoff"].as_str().unwrap().contains("Second"));
+        assert!(stale_claims.is_err());
+        assert!(stale_handoff_section.is_err());
+        for name in [
+            "threadmark_create_effort",
+            "threadmark_get_snapshot",
+            "threadmark_get_history",
+            "threadmark_add_fog",
+            "threadmark_graduate_fog",
+            "threadmark_propose_contradiction",
+            "threadmark_render_handoff",
+        ] {
+            assert!(tool_definitions().iter().any(|tool| tool["name"] == name));
+        }
+        let snapshot_definition = tool_definitions()
+            .into_iter()
+            .find(|tool| tool["name"] == "threadmark_get_snapshot")
+            .unwrap();
+        assert!(snapshot_definition["inputSchema"]["properties"]["snapshot"].is_object());
+        for name in [
+            "threadmark_add_fog",
+            "threadmark_graduate_fog",
+            "threadmark_propose_contradiction",
+        ] {
+            let definition = tool_definitions()
+                .into_iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            assert!(
+                definition["inputSchema"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("expected_version"))
+            );
         }
     }
 

@@ -2,7 +2,8 @@
 
 use std::{path::Path, str::FromStr, time::Duration};
 
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sqlx::{
     QueryBuilder, Row, Sqlite, SqlitePool, Transaction,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow},
@@ -13,6 +14,26 @@ use threadmark_domain::{
     GraphSnapshot, Lifecycle, Node, NodeRevision, Reversibility, RiskLevel, Source, Uncertainty,
     Workspace,
 };
+
+#[derive(Clone, Copy, Debug)]
+pub struct Pagination {
+    pub limit: u32,
+    pub offset: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EventCursor {
+    pub occurred_at: String,
+    pub id: String,
+    pub through_rowid: i64,
+    pub filter: EventFilter,
+}
+
+#[derive(Clone, Debug)]
+pub struct EventPage {
+    pub limit: u32,
+    pub cursor: Option<EventCursor>,
+}
 use time::{
     Duration as TimeDuration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339,
 };
@@ -46,6 +67,8 @@ pub enum StoreError {
     ClaimNotOwned(String),
     #[error("effort version conflict: expected {expected}, actual {actual}")]
     VersionConflict { expected: i64, actual: i64 },
+    #[error("history cursor filters changed")]
+    CursorFilterMismatch,
 }
 
 #[derive(Clone, Debug)]
@@ -213,6 +236,17 @@ impl Store {
             .await?
             .ok_or(StoreError::NotFound)?;
         Ok(row_to_workspace(row))
+    }
+
+    pub async fn list_workspaces(&self) -> Result<Vec<Workspace>, StoreError> {
+        Ok(
+            sqlx::query("SELECT * FROM workspaces ORDER BY created_at,id")
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .map(row_to_workspace)
+                .collect(),
+        )
     }
 
     pub async fn create_effort(
@@ -383,6 +417,31 @@ impl Store {
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(row_to_revision).collect()
+    }
+
+    pub async fn list_revisions_page(
+        &self,
+        node_id: &str,
+        page: Pagination,
+    ) -> Result<(Vec<NodeRevision>, Option<u32>), StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM node_revisions WHERE node_id=? ORDER BY revision LIMIT ? OFFSET ?",
+        )
+        .bind(node_id)
+        .bind(page.limit + 1)
+        .bind(page.offset)
+        .fetch_all(&self.pool)
+        .await?;
+        let has_more = rows.len() > page.limit as usize;
+        let revisions = rows
+            .into_iter()
+            .take(page.limit as usize)
+            .map(row_to_revision)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((
+            revisions,
+            has_more.then_some(page.offset.saturating_add(page.limit)),
+        ))
     }
 
     pub async fn insert_edge(
@@ -567,6 +626,19 @@ impl Store {
             .fetch_one(&mut *tx)
             .await?;
         let claim = row_to_claim(row);
+        let effort_id: String = sqlx::query_scalar(
+            "SELECT nodes.effort_id FROM claims JOIN nodes ON nodes.id=claims.node_id WHERE claims.id=?",
+        )
+        .bind(claim_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO store_metadata(key,value) VALUES(?, '1') \
+             ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1",
+        )
+        .bind(format!("claims_version:{effort_id}"))
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(claim)
     }
@@ -774,9 +846,10 @@ impl Store {
         })
     }
 
-    pub async fn snapshot_with_events(
+    pub async fn snapshot_bundle(
         &self,
         effort_id: &str,
+        include_events: bool,
     ) -> Result<(Effort, GraphSnapshot, Vec<Source>, Vec<AuditEvent>), StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         reap_expired_claims(&mut tx, effort_id).await?;
@@ -849,14 +922,20 @@ impl Store {
                 .or_insert_with(Vec::new)
                 .push(row.get("source_id"));
         }
-        let mut events = sqlx::query("SELECT * FROM events WHERE effort_id=?")
-            .bind(effort_id)
-            .fetch_all(&mut *tx)
-            .await?
-            .into_iter()
-            .map(row_to_event)
-            .collect::<Result<Vec<_>, _>>()?;
-        sort_events(&mut events)?;
+        let mut events = if include_events {
+            sqlx::query("SELECT * FROM events WHERE effort_id=?")
+                .bind(effort_id)
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .map(row_to_event)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            vec![]
+        };
+        if include_events {
+            sort_events(&mut events)?;
+        }
         let sources = sqlx::query("SELECT * FROM sources WHERE effort_id=? ORDER BY created_at")
             .bind(effort_id)
             .fetch_all(&mut *tx)
@@ -879,6 +958,85 @@ impl Store {
             sources,
             events,
         ))
+    }
+
+    pub async fn snapshot_section(
+        &self,
+        effort_id: &str,
+        section: &str,
+        page: Pagination,
+    ) -> Result<(Effort, Vec<Value>, Option<u32>, i64, i64), StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        reap_expired_claims(&mut tx, effort_id).await?;
+        let effort = row_to_effort(
+            sqlx::query("SELECT * FROM efforts WHERE id=?")
+                .bind(effort_id)
+                .fetch_one(&mut *tx)
+                .await?,
+        )?;
+        let event_rowid =
+            sqlx::query_scalar("SELECT COALESCE(MAX(rowid),0) FROM events WHERE effort_id=?")
+                .bind(effort_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let claims_version: i64 = sqlx::query_scalar(
+            "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM store_metadata WHERE key=?),0)",
+        )
+        .bind(format!("claims_version:{effort_id}"))
+        .fetch_one(&mut *tx)
+        .await?;
+        let limit = page.limit.saturating_add(1);
+        let mut items = match section {
+            "nodes" => sqlx::query("SELECT n.*,r.body,r.payload_json FROM nodes n JOIN node_revisions r ON r.node_id=n.id AND r.revision=n.current_revision WHERE n.effort_id=? ORDER BY n.created_at,n.id LIMIT ? OFFSET ?")
+                .bind(effort_id).bind(limit).bind(page.offset).fetch_all(&mut *tx).await?
+                .into_iter().map(row_to_node).map(|value| value.map(|value| serde_json::to_value(value).expect("node serializes"))).collect::<Result<_,_>>()?,
+            "edges" => sqlx::query("SELECT * FROM edges WHERE effort_id=? ORDER BY created_at,id LIMIT ? OFFSET ?")
+                .bind(effort_id).bind(limit).bind(page.offset).fetch_all(&mut *tx).await?
+                .into_iter().map(row_to_edge).map(|value| value.map(|value| serde_json::to_value(value).expect("edge serializes"))).collect::<Result<_,_>>()?,
+            "claims" => sqlx::query("SELECT c.* FROM claims c JOIN nodes n ON n.id=c.node_id WHERE n.effort_id=? ORDER BY c.claimed_at,c.id LIMIT ? OFFSET ?")
+                .bind(effort_id).bind(limit).bind(page.offset).fetch_all(&mut *tx).await?
+                .into_iter().map(row_to_claim).map(|value| serde_json::to_value(value).expect("claim serializes")).collect(),
+            "fog_patches" => {
+                let rows = sqlx::query("SELECT * FROM fog_patches WHERE effort_id=? ORDER BY created_at,id LIMIT ? OFFSET ?")
+                    .bind(effort_id).bind(limit).bind(page.offset).fetch_all(&mut *tx).await?;
+                let mut items = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let id: String = row.get("id");
+                    let graduated_to = sqlx::query("SELECT node_id FROM fog_graduations WHERE fog_id=? ORDER BY node_id")
+                        .bind(&id).fetch_all(&mut *tx).await?.into_iter().map(|row| row.get("node_id")).collect();
+                    items.push(serde_json::to_value(FogPatch {
+                        id,
+                        effort_id: row.get("effort_id"),
+                        title: row.get("title"),
+                        description: row.get("description"),
+                        anchor_node_id: row.get("anchor_node_id"),
+                        status: parse("fog.status", row.get::<String, _>("status"))?,
+                        graduated_to,
+                        created_at: row.get("created_at"),
+                        updated_at: row.get("updated_at"),
+                    }).expect("fog patch serializes"));
+                }
+                items
+            }
+            "findings" => sqlx::query("SELECT * FROM findings WHERE effort_id=? ORDER BY created_at,id LIMIT ? OFFSET ?")
+                .bind(effort_id).bind(limit).bind(page.offset).fetch_all(&mut *tx).await?
+                .into_iter().map(row_to_finding).map(|value| value.map(|value| serde_json::to_value(value).expect("finding serializes"))).collect::<Result<_,_>>()?,
+            "exit_criteria" => sqlx::query("SELECT * FROM exit_criteria WHERE effort_id=? ORDER BY created_at,id LIMIT ? OFFSET ?")
+                .bind(effort_id).bind(limit).bind(page.offset).fetch_all(&mut *tx).await?
+                .into_iter().map(row_to_criterion).map(|value| value.map(|value| serde_json::to_value(value).expect("criterion serializes"))).collect::<Result<_,_>>()?,
+            "sources" => sqlx::query("SELECT * FROM sources WHERE effort_id=? ORDER BY created_at,id LIMIT ? OFFSET ?")
+                .bind(effort_id).bind(limit).bind(page.offset).fetch_all(&mut *tx).await?
+                .into_iter().map(row_to_source).map(|value| value.map(|value| serde_json::to_value(value).expect("source serializes"))).collect::<Result<_,_>>()?,
+            "node_sources" => sqlx::query("SELECT ns.node_id,ns.source_id,ns.relationship FROM node_sources ns JOIN nodes n ON n.id=ns.node_id WHERE n.effort_id=? ORDER BY ns.node_id,ns.source_id,ns.relationship LIMIT ? OFFSET ?")
+                .bind(effort_id).bind(limit).bind(page.offset).fetch_all(&mut *tx).await?
+                .into_iter().map(|row| json!({"node_id":row.get::<String,_>("node_id"),"source_id":row.get::<String,_>("source_id"),"relationship":row.get::<String,_>("relationship")})).collect(),
+            _ => return Err(StoreError::NotFound),
+        };
+        let has_more = items.len() > page.limit as usize;
+        items.truncate(page.limit as usize);
+        let next = has_more.then_some(page.offset.saturating_add(page.limit));
+        tx.commit().await?;
+        Ok((effort, items, next, event_rowid, claims_version))
     }
 
     pub async fn list_fog(&self, effort_id: &str) -> Result<Vec<FogPatch>, StoreError> {
@@ -917,6 +1075,24 @@ impl Store {
         workspace_id: &str,
         filter: &EventFilter,
     ) -> Result<Vec<AuditEvent>, StoreError> {
+        Ok(self.query_events(workspace_id, filter, None).await?.0)
+    }
+
+    pub async fn list_events_page(
+        &self,
+        workspace_id: &str,
+        filter: &EventFilter,
+        page: EventPage,
+    ) -> Result<(Vec<AuditEvent>, Option<EventCursor>), StoreError> {
+        self.query_events(workspace_id, filter, Some(page)).await
+    }
+
+    async fn query_events(
+        &self,
+        workspace_id: &str,
+        filter: &EventFilter,
+        page: Option<EventPage>,
+    ) -> Result<(Vec<AuditEvent>, Option<EventCursor>), StoreError> {
         let occurred_from = filter
             .occurred_from
             .as_deref()
@@ -929,11 +1105,32 @@ impl Store {
             .transpose()?;
         let occurred_from_candidate = occurred_from.and_then(|value| time_candidate(value, -1));
         let occurred_to_candidate = occurred_to.and_then(|value| time_candidate(value, 1));
+        if page
+            .as_ref()
+            .and_then(|page| page.cursor.as_ref())
+            .is_some_and(|cursor| cursor.filter != *filter)
+        {
+            return Err(StoreError::CursorFilterMismatch);
+        }
         let mut query = QueryBuilder::<Sqlite>::new(
             "SELECT events.* FROM events JOIN efforts ON efforts.id=events.effort_id \
              WHERE efforts.workspace_id=",
         );
         query.push_bind(workspace_id);
+        let through_rowid = match &page {
+            Some(page) => match &page.cursor {
+                Some(cursor) => cursor.through_rowid,
+                None => {
+                    sqlx::query_scalar("SELECT COALESCE(MAX(rowid),0) FROM events")
+                        .fetch_one(&self.pool)
+                        .await?
+                }
+            },
+            None => 0,
+        };
+        if page.is_some() {
+            query.push(" AND events.rowid<=").push_bind(through_rowid);
+        }
         if let Some(value) = &filter.effort_id {
             query.push(" AND events.effort_id=").push_bind(value);
         }
@@ -955,14 +1152,32 @@ impl Store {
         if let Some(value) = &occurred_to_candidate {
             query.push(" AND events.occurred_at<").push_bind(value);
         }
-        let rows = query
-            .push(" ORDER BY events.occurred_at,events.id")
-            .build()
-            .fetch_all(&self.pool)
-            .await?;
+        if let Some(cursor) = page.as_ref().and_then(|page| page.cursor.as_ref()) {
+            query
+                .push(" AND (events.occurred_at>")
+                .push_bind(&cursor.occurred_at)
+                .push(" OR (events.occurred_at=")
+                .push_bind(&cursor.occurred_at)
+                .push(" AND events.id>")
+                .push_bind(&cursor.id)
+                .push("))");
+        }
+        query.push(" ORDER BY events.occurred_at,events.id");
+        if let Some(page) = &page {
+            query
+                .push(" LIMIT ")
+                .push_bind(page.limit.saturating_add(1));
+        }
+        let rows = query.build().fetch_all(&self.pool).await?;
+        let has_more = page
+            .as_ref()
+            .is_some_and(|page| rows.len() > page.limit as usize);
+        let row_limit = page.as_ref().map_or(rows.len(), |page| page.limit as usize);
         let mut events = Vec::with_capacity(rows.len());
-        for row in rows {
+        let mut last_seen = None;
+        for row in rows.into_iter().take(row_limit) {
             let event = row_to_event(row)?;
+            last_seen = Some((event.occurred_at.clone(), event.id.clone()));
             let occurred_at = parse_timestamp(&event.occurred_at)?;
             if occurred_from.is_some_and(|bound| occurred_at < bound)
                 || occurred_to.is_some_and(|bound| occurred_at > bound)
@@ -973,7 +1188,16 @@ impl Store {
         }
         let mut events = events.into_iter().map(|(_, event)| event).collect();
         sort_events(&mut events)?;
-        Ok(events)
+        let next_cursor = has_more.then(|| {
+            let (occurred_at, id) = last_seen.expect("a full page has a last event");
+            EventCursor {
+                occurred_at,
+                id,
+                through_rowid,
+                filter: filter.clone(),
+            }
+        });
+        Ok((events, next_cursor))
     }
 
     pub async fn list_sources(&self, effort_id: &str) -> Result<Vec<Source>, StoreError> {
@@ -1298,13 +1522,33 @@ fn parse_timestamp(value: &str) -> Result<OffsetDateTime, StoreError> {
 fn normalize_timestamp(value: &str) -> Result<String, StoreError> {
     parse_timestamp(value)?
         .to_offset(UtcOffset::UTC)
-        .format(&Rfc3339)
+        .format(time::macros::format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z"
+        ))
         .map_err(|_| StoreError::InvalidTimestamp(value.into()))
 }
 
 async fn normalize_event_timestamps(pool: &SqlitePool) -> Result<(), StoreError> {
+    let completed: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM store_metadata WHERE key='event_timestamps_normalized')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if completed {
+        return Ok(());
+    }
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let completed: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM store_metadata WHERE key='event_timestamps_normalized')",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if completed {
+        tx.commit().await?;
+        return Ok(());
+    }
     let rows = sqlx::query("SELECT id,occurred_at FROM events")
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?;
     for row in rows {
         let id: String = row.get("id");
@@ -1314,10 +1558,14 @@ async fn normalize_event_timestamps(pool: &SqlitePool) -> Result<(), StoreError>
             sqlx::query("UPDATE events SET occurred_at=? WHERE id=?")
                 .bind(normalized)
                 .bind(id)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
         }
     }
+    sqlx::query("INSERT INTO store_metadata(key,value) VALUES('event_timestamps_normalized','1')")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1486,9 +1734,8 @@ mod tests {
     #[tokio::test]
     async fn filters_event_times_as_instants_without_losing_precision() {
         let directory = TempDir::new().unwrap();
-        let store = Store::connect(&directory.path().join("state.sqlite3"))
-            .await
-            .unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let store = Store::connect(&path).await.unwrap();
         sqlx::query("INSERT INTO workspaces(id,name,root_uri,schema_version,created_at,updated_at) VALUES('workspace','test','test',1,'now','now')")
             .execute(&store.pool).await.unwrap();
         sqlx::query("INSERT INTO efforts(id,workspace_id,slug,title,destination,status,version,created_at,updated_at) VALUES('effort','workspace','test','test','test','active',1,'now','now')")
@@ -1497,6 +1744,12 @@ mod tests {
             .execute(&store.pool).await.unwrap();
         sqlx::query("INSERT INTO events(id,effort_id,actor_id,event_type,entity_type,entity_id,occurred_at) VALUES('early','effort','test','ordered','node','node','2026-01-01T00:30:00.123Z'),('late','effort','test','ordered','node','node','2026-01-01T00:30:00.123456Z')")
             .execute(&store.pool).await.unwrap();
+        sqlx::query("DELETE FROM store_metadata WHERE key='event_timestamps_normalized'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        drop(store);
+        let store = Store::connect(&path).await.unwrap();
 
         let events = store
             .list_events(
@@ -1538,6 +1791,38 @@ mod tests {
             events.iter().map(|event| &event.id).collect::<Vec<_>>(),
             ["early", "late"]
         );
+        let filter = EventFilter {
+            event_type: Some("ordered".into()),
+            ..EventFilter::default()
+        };
+
+        let (first, next) = store
+            .list_events_page(
+                "workspace",
+                &filter,
+                EventPage {
+                    limit: 1,
+                    cursor: None,
+                },
+            )
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO events(id,effort_id,actor_id,event_type,entity_type,entity_id,occurred_at) VALUES('inserted','effort','test','ordered','node','node','2026-01-01T00:30:00.122000000Z')")
+            .execute(&store.pool).await.unwrap();
+        let (second, _) = store
+            .list_events_page(
+                "workspace",
+                &filter,
+                EventPage {
+                    limit: 1,
+                    cursor: next,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first[0].id, "early");
+        assert_eq!(second[0].id, "late");
     }
 
     #[tokio::test]

@@ -16,10 +16,10 @@ toml.workspace = true
 ulid.workspace = true
 threadmark-domain = { path = "../threadmark-domain" }
 threadmark-store = { path = "../threadmark-store" }
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio.workspace = true
 
 [lints]
 workspace = true

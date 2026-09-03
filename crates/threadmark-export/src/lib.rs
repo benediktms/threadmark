@@ -140,99 +140,167 @@ pub fn read_package(directory: &Path) -> Result<PortableEffort, ExportError> {
 }
 
 pub fn render_handoff(package: &PortableEffort) -> String {
-    let effort = &package.effort;
-    let graph = &package.graph;
-    let mut output = format!(
-        "# {} — reasoning handoff\n\n## Destination\n\n{}\n\n## Scope\n\n{}\n\n",
-        effort.title, effort.destination, effort.scope_notes
-    );
-    section_nodes(&mut output, "Constraints", graph, NodeKind::Constraint);
-    section_nodes(&mut output, "Decisions", graph, NodeKind::Decision);
-    section_nodes(
-        &mut output,
-        "Active assumptions",
-        graph,
-        NodeKind::Assumption,
-    );
-    section_nodes(&mut output, "Evidence", graph, NodeKind::Evidence);
-    section_nodes(&mut output, "Experiments", graph, NodeKind::Experiment);
-
-    output.push_str("## Residual uncertainty\n\n");
-    let open: Vec<_> = graph
-        .nodes
-        .iter()
-        .filter(|node| matches!(node.lifecycle, Lifecycle::Open | Lifecycle::InProgress))
-        .collect();
-    if open.is_empty() {
-        output.push_str("None recorded.\n\n");
-    } else {
-        for node in open {
-            output.push_str(&format!(
-                "- **{}** (`{}`): {}\n",
-                node.title, node.id, node.summary
-            ));
-        }
-        output.push('\n');
-    }
-
-    output.push_str("## Active findings\n\n");
-    let active: Vec<_> = graph
-        .findings
-        .iter()
-        .filter(|finding| {
-            matches!(
-                finding.status,
-                FindingStatus::Proposed | FindingStatus::Accepted
-            )
-        })
-        .collect();
-    if active.is_empty() {
-        output.push_str("None recorded.\n\n");
-    } else {
-        for finding in active {
-            output.push_str(&format!("- **{}**: {}\n", finding.title, finding.detail));
-        }
-        output.push('\n');
-    }
-
-    output.push_str("## Fog and out of scope\n\n");
-    for fog in &graph.fog_patches {
-        output.push_str(&format!(
-            "- **{}** ({}): {}\n",
-            fog.title,
-            fog.status.as_str(),
-            fog.description
-        ));
-    }
-    if graph.fog_patches.is_empty() {
-        output.push_str("None recorded.\n");
-    }
-    output.push_str("\n## Decision relationships\n\n");
-    for edge in graph.edges.iter().filter(|edge| {
-        matches!(
-            edge.edge_type,
-            EdgeType::Assumes | EdgeType::Supports | EdgeType::Supersedes | EdgeType::Contradicts
-        )
-    }) {
-        output.push_str(&format!(
-            "- `{}` {} `{}`\n",
-            edge.source_node_id, edge.edge_type, edge.target_node_id
-        ));
-    }
-    output
+    ["overview", "nodes", "findings", "fog_patches", "edges"]
+        .into_iter()
+        .filter_map(|section| render_handoff_section(package, section, true))
+        .collect()
 }
 
-fn section_nodes(output: &mut String, title: &str, graph: &GraphSnapshot, kind: NodeKind) {
-    output.push_str(&format!("## {title}\n\n"));
+#[must_use]
+pub fn render_handoff_section(
+    package: &PortableEffort,
+    section: &str,
+    complete: bool,
+) -> Option<String> {
+    let effort = &package.effort;
+    let graph = &package.graph;
+    let mut output = String::new();
+    match section {
+        "overview" => output.push_str(&format!(
+            "# {} — reasoning handoff\n\n## Destination\n\n{}\n\n## Scope\n\n{}\n\n",
+            effort.title, effort.destination, effort.scope_notes
+        )),
+        "nodes" => {
+            section_nodes(
+                &mut output,
+                "Constraints",
+                graph,
+                NodeKind::Constraint,
+                complete,
+            );
+            section_nodes(
+                &mut output,
+                "Decisions",
+                graph,
+                NodeKind::Decision,
+                complete,
+            );
+            section_nodes(
+                &mut output,
+                "Active assumptions",
+                graph,
+                NodeKind::Assumption,
+                complete,
+            );
+            section_nodes(&mut output, "Evidence", graph, NodeKind::Evidence, complete);
+            section_nodes(
+                &mut output,
+                "Experiments",
+                graph,
+                NodeKind::Experiment,
+                complete,
+            );
+
+            let open: Vec<_> = graph
+                .nodes
+                .iter()
+                .filter(|node| matches!(node.lifecycle, Lifecycle::Open | Lifecycle::InProgress))
+                .collect();
+            if open.is_empty() && complete {
+                output.push_str("## Residual uncertainty\n\n");
+                output.push_str("None recorded.\n\n");
+            } else if !open.is_empty() {
+                output.push_str("## Residual uncertainty\n\n");
+                for node in open {
+                    output.push_str(&format!(
+                        "- **{}** (`{}`): {}\n",
+                        node.title, node.id, node.summary
+                    ));
+                }
+                output.push('\n');
+            }
+        }
+        "findings" => {
+            let active: Vec<_> = graph
+                .findings
+                .iter()
+                .filter(|finding| {
+                    matches!(
+                        finding.status,
+                        FindingStatus::Proposed | FindingStatus::Accepted
+                    )
+                })
+                .collect();
+            if active.is_empty() && complete {
+                output.push_str("## Active findings\n\n");
+                output.push_str("None recorded.\n\n");
+            } else if !active.is_empty() {
+                output.push_str("## Active findings\n\n");
+                for finding in active {
+                    output.push_str(&format!("- **{}**: {}\n", finding.title, finding.detail));
+                }
+                output.push('\n');
+            }
+        }
+        "fog_patches" => {
+            if graph.fog_patches.is_empty() && complete {
+                output.push_str("## Fog and out of scope\n\n");
+                output.push_str("None recorded.\n");
+            } else if !graph.fog_patches.is_empty() {
+                output.push_str("## Fog and out of scope\n\n");
+                for fog in &graph.fog_patches {
+                    output.push_str(&format!(
+                        "- **{}** ({}): {}\n",
+                        fog.title,
+                        fog.status.as_str(),
+                        fog.description
+                    ));
+                }
+            }
+            if complete || !graph.fog_patches.is_empty() {
+                output.push('\n');
+            }
+        }
+        "edges" => {
+            let edges: Vec<_> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    matches!(
+                        edge.edge_type,
+                        EdgeType::Assumes
+                            | EdgeType::Supports
+                            | EdgeType::Supersedes
+                            | EdgeType::Contradicts
+                    )
+                })
+                .collect();
+            if complete || !edges.is_empty() {
+                output.push_str("## Decision relationships\n\n");
+                for edge in edges {
+                    output.push_str(&format!(
+                        "- `{}` {} `{}`\n",
+                        edge.source_node_id, edge.edge_type, edge.target_node_id
+                    ));
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some(output)
+}
+
+fn section_nodes(
+    output: &mut String,
+    title: &str,
+    graph: &GraphSnapshot,
+    kind: NodeKind,
+    complete: bool,
+) {
     let nodes: Vec<_> = graph
         .nodes
         .iter()
         .filter(|node| node.kind == kind && node.validity != Validity::Superseded)
         .collect();
-    if nodes.is_empty() {
+    if nodes.is_empty() && complete {
+        output.push_str(&format!("## {title}\n\n"));
         output.push_str("None recorded.\n\n");
         return;
     }
+    if nodes.is_empty() {
+        return;
+    }
+    output.push_str(&format!("## {title}\n\n"));
     for node in nodes {
         output.push_str(&format!("### {}\n\n", node.title));
         if !node.summary.is_empty() {

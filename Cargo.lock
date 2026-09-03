@@ -1758,6 +1758,7 @@ dependencies = [
  "tempfile",
  "threadmark-application",
  "threadmark-domain",
+ "threadmark-export",
  "tokio",
  "tracing",
  "tracing-subscriber",

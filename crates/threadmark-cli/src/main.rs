@@ -1,13 +1,10 @@
-use std::{
-    path::{Path, PathBuf},
-    process::Command as ProcessCommand,
-};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::{Value, json};
-use threadmark_application::{AddEdge, AddNode, CreateEffort, ReopenEffort, Service};
+use threadmark_application::{AddEdge, AddNode, CreateEffort, ReopenEffort, Service, project_root};
 use threadmark_domain::{
     Confidence, EdgeType, Lifecycle, NewEdge, NewNode, NodeKind, Reversibility, RiskLevel,
     SourceKind, SourceTrust, Uncertainty, Validity,
@@ -380,7 +377,7 @@ async fn main() -> Result<()> {
     let workspace = match cli.workspace {
         Some(workspace) => workspace,
         None if matches!(&cli.command, Command::Init { .. }) => {
-            init_workspace(&std::env::current_dir()?)
+            project_root(&std::env::current_dir()?)
         }
         None => PathBuf::from("."),
     };
@@ -396,17 +393,6 @@ async fn main() -> Result<()> {
     }
     let service = Service::open(&workspace).await?;
     dispatch(&service, cli.command, cli.json).await
-}
-
-fn init_workspace(current_dir: &Path) -> PathBuf {
-    ProcessCommand::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(current_dir)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
-        .unwrap_or_else(|| current_dir.to_path_buf())
 }
 
 async fn dispatch(service: &Service, command: Command, json_output: bool) -> Result<()> {
@@ -763,7 +749,7 @@ async fn dispatch(service: &Service, command: Command, json_output: bool) -> Res
                 actor,
                 expected_version,
             } => {
-                let version = service
+                let (to, version) = service
                     .graduate_fog(&effort, &fog, &to, &actor, expected_version)
                     .await?;
                 output(
@@ -1171,9 +1157,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            init_workspace(&crate_dir.join("src"))
-                .canonicalize()
-                .unwrap(),
+            project_root(&crate_dir.join("src")).canonicalize().unwrap(),
             expected
         );
     }

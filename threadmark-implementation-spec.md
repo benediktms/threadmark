@@ -976,6 +976,7 @@ The MCP server runs over stdio in v1. Tool names use the `threadmark_` prefix.
 
 - `threadmark_list_efforts`
 - `threadmark_get_context`
+- `threadmark_get_snapshot`
 - `threadmark_get_frontier`
 - `threadmark_get_node`
 - `threadmark_explain_node`
@@ -983,6 +984,7 @@ The MCP server runs over stdio in v1. Tool names use the `threadmark_` prefix.
 - `threadmark_lint`
 - `threadmark_get_findings`
 - `threadmark_get_history`
+- `threadmark_render_handoff`
 
 ### 23.2 Claim tools
 
@@ -994,7 +996,9 @@ The MCP server runs over stdio in v1. Tool names use the `threadmark_` prefix.
 ### 23.3 Mutation tools
 
 - `threadmark_apply_batch`
+- `threadmark_create_effort`
 - `threadmark_reopen_effort`
+- `threadmark_add_fog`
 - `threadmark_resolve_node`
 - `threadmark_reopen_node`
 - `threadmark_propose_contradiction`

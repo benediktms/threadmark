@@ -19,6 +19,7 @@ use threadmark_domain::{
     calculate_frontier, evaluate_readiness, lint_graph, preview_invalidation, validate_edge,
 };
 use threadmark_store::{ClaimGuard, Store, StoreError};
+pub use threadmark_store::{EventCursor, EventPage, Pagination};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use ulid::Ulid;
 
@@ -118,36 +119,87 @@ struct WorkspaceMarker {
 impl Service {
     pub async fn init(root: &Path, name: &str) -> Result<Self, ApplicationError> {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        fs::create_dir_all(&root)?;
         let marker_path = root.join(MARKER);
         if marker_path.exists() {
             return Self::open(&root).await;
         }
+        let database_path = database_path(&root);
+        fs::create_dir_all(database_path.parent().expect("database has a parent"))?;
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(database_path.with_file_name("init.lock"))?;
+        let _lock = tokio::task::spawn_blocking(move || {
+            lock.lock()?;
+            Ok::<_, std::io::Error>(lock)
+        })
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))??;
+        if marker_path.exists() {
+            return Self::open(&root).await;
+        }
         fs::create_dir_all(root.join(".threadmark/exports"))?;
-        let workspace_id = id();
+        let store = Store::connect(&database_path).await?;
+        let key = workspace_key(&root);
+        let existing = store
+            .list_workspaces()
+            .await?
+            .into_iter()
+            .find(|workspace| workspace_key(Path::new(&workspace.root_uri)) == key);
+        let workspace_id = existing
+            .as_ref()
+            .map_or_else(id, |workspace| workspace.id.clone());
+        let name = existing
+            .as_ref()
+            .map_or(name, |workspace| workspace.name.as_str());
         let marker = toml::to_string(&WorkspaceMarker {
             schema_version: SCHEMA_VERSION,
             workspace_id: workspace_id.clone(),
             name: name.into(),
         })
         .map_err(|error| ApplicationError::InvalidMarker(error.to_string()))?;
-        fs::write(&marker_path, marker)?;
         let timestamp = now();
         let workspace = Workspace {
             id: workspace_id,
             name: name.into(),
             root_uri: root.to_string_lossy().into_owned(),
             schema_version: SCHEMA_VERSION,
-            created_at: timestamp.clone(),
+            created_at: existing.as_ref().map_or_else(
+                || timestamp.clone(),
+                |workspace| workspace.created_at.clone(),
+            ),
             updated_at: timestamp,
         };
-        let database_path = database_path(&root);
-        let store = Store::connect(&database_path).await?;
-        store.create_workspace(&workspace).await?;
+        if existing.is_some() {
+            store.reconcile_workspace(&workspace).await?;
+        } else {
+            store.create_workspace(&workspace).await?;
+        }
+        fs::write(&marker_path, marker)?;
+        let workspace = store.get_workspace(&workspace.id).await?;
         Ok(Self {
             root,
             workspace,
             store,
         })
+    }
+
+    pub async fn open_or_init(start: &Path) -> Result<Self, ApplicationError> {
+        match Self::open(start).await {
+            Ok(service) => Ok(service),
+            Err(ApplicationError::NotInitialized(_)) => {
+                let root = project_root(start);
+                let name = root
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("workspace");
+                Self::init(&root, name).await
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn open(start: &Path) -> Result<Self, ApplicationError> {
@@ -436,7 +488,29 @@ impl Service {
         ApplicationError,
     > {
         let effort = self.get_effort(effort).await?;
-        Ok(self.store.snapshot_with_events(&effort.id).await?)
+        Ok(self.store.snapshot_bundle(&effort.id, true).await?)
+    }
+
+    pub async fn snapshot_with_sources(
+        &self,
+        effort: &str,
+    ) -> Result<(Effort, GraphSnapshot, Vec<threadmark_domain::Source>), ApplicationError> {
+        let effort = self.get_effort(effort).await?;
+        let (effort, graph, sources, _) = self.store.snapshot_bundle(&effort.id, false).await?;
+        Ok((effort, graph, sources))
+    }
+
+    pub async fn snapshot_section(
+        &self,
+        effort: &str,
+        section: &str,
+        page: Pagination,
+    ) -> Result<(Effort, Vec<Value>, Option<u32>, i64, i64), ApplicationError> {
+        let effort = self.get_effort(effort).await?;
+        Ok(self
+            .store
+            .snapshot_section(&effort.id, section, page)
+            .await?)
     }
 
     pub async fn status(&self, effort: &str) -> Result<EffortStatusView, ApplicationError> {
@@ -486,12 +560,39 @@ impl Service {
         Ok(self.store.list_revisions(&node.id).await?)
     }
 
+    pub async fn node_history_page(
+        &self,
+        effort: &str,
+        node: &str,
+        page: Pagination,
+    ) -> Result<(Vec<NodeRevision>, Option<u32>), ApplicationError> {
+        let node = self.get_node(effort, node).await?;
+        Ok(self.store.list_revisions_page(&node.id, page).await?)
+    }
+
     pub async fn effort_history(&self, effort: &str) -> Result<Vec<AuditEvent>, ApplicationError> {
         self.history(EventFilter {
             effort_id: Some(effort.into()),
             ..EventFilter::default()
         })
         .await
+    }
+
+    pub async fn effort_history_page(
+        &self,
+        effort: &str,
+        mut filter: EventFilter,
+        page: EventPage,
+    ) -> Result<(Vec<AuditEvent>, Option<EventCursor>), ApplicationError> {
+        let effort = self.get_effort(effort).await?;
+        if effort.status == EffortStatus::Active {
+            self.store.reap_expired_claims(&effort.id).await?;
+        }
+        filter.effort_id = Some(effort.id);
+        Ok(self
+            .store
+            .list_events_page(&self.workspace.id, &filter, page)
+            .await?)
     }
 
     pub async fn history(
@@ -987,7 +1088,7 @@ impl Service {
         node_selectors: &[String],
         actor_id: &str,
         expected_version: Option<i64>,
-    ) -> Result<i64, ApplicationError> {
+    ) -> Result<(Vec<String>, i64), ApplicationError> {
         let effort = self.active_effort(effort).await?;
         let expected = expected_version.unwrap_or(effort.version);
         let mut node_ids = Vec::with_capacity(node_selectors.len());
@@ -1013,10 +1114,11 @@ impl Service {
             None,
             &timestamp,
         );
-        Ok(self
+        let version = self
             .store
             .graduate_fog(&effort.id, fog_id, &node_ids, &audit, expected, &timestamp)
-            .await?)
+            .await?;
+        Ok((node_ids, version))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1310,6 +1412,25 @@ fn discover_root(start: &Path) -> Result<PathBuf, ApplicationError> {
             ));
         }
     }
+}
+
+#[must_use]
+pub fn project_root(start: &Path) -> PathBuf {
+    Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(start)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+        .unwrap_or_else(|| start.to_path_buf())
+}
+
+fn workspace_key(root: &Path) -> PathBuf {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let project = project_root(&root);
+    let project = project.canonicalize().unwrap_or(project);
+    root.strip_prefix(project).unwrap_or(&root).to_path_buf()
 }
 
 fn database_path(root: &Path) -> PathBuf {
