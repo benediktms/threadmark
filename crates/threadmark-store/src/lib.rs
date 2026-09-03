@@ -65,6 +65,8 @@ pub enum StoreError {
     NotFound,
     #[error("claim is not actively owned by {0}")]
     ClaimNotOwned(String),
+    #[error("node belongs to accepted contradiction {0}")]
+    AcceptedContradiction(String),
     #[error("effort version conflict: expected {expected}, actual {actual}")]
     VersionConflict { expected: i64, actual: i64 },
     #[error("history cursor filters changed")]
@@ -94,6 +96,11 @@ pub enum BatchMutation {
         node: Node,
         revision: NodeRevision,
         claimant: Option<String>,
+        event: Option<AuditEvent>,
+    },
+    ChallengeNode {
+        node: Node,
+        revision: NodeRevision,
         event: Option<AuditEvent>,
     },
     InsertEdge {
@@ -521,6 +528,17 @@ impl Store {
         event.occurred_at.clone_from(&cutoff);
         event.after = Some(serde_json::to_value(&*node).expect("node is serializable"));
         check_version(&mut tx, &node.effort_id, expected_version).await?;
+        if node.validity == threadmark_domain::Validity::Current {
+            let findings = sqlx::query("SELECT id,related_nodes_json FROM findings WHERE effort_id=? AND type='contradiction' AND status='accepted'")
+                .bind(&node.effort_id).fetch_all(&mut *tx).await?;
+            for finding in findings {
+                let related: Vec<String> =
+                    parse_json("finding.related_nodes", finding.get("related_nodes_json"))?;
+                if related.contains(&node.id) {
+                    return Err(StoreError::AcceptedContradiction(finding.get("id")));
+                }
+            }
+        }
         if let ClaimGuard::MustOwn(claimant) | ClaimGuard::OwnIfClaimed(claimant) = claim_guard {
             let owner: Option<String> = sqlx::query_scalar(
                 "SELECT claimant FROM claims WHERE node_id=? \
@@ -820,10 +838,14 @@ impl Store {
         expected_version: i64,
         mutations: &[BatchMutation],
         now: &str,
-    ) -> Result<(i64, Vec<Node>, Vec<Claim>), StoreError> {
+    ) -> Result<(i64, Vec<Node>, Vec<Claim>, Vec<Node>, Vec<Claim>), StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let cutoff = reap_expired_claims(&mut tx, effort_id).await?;
         check_version(&mut tx, effort_id, expected_version).await?;
+        let before_nodes = sqlx::query("SELECT n.*,r.body,r.payload_json FROM nodes n JOIN node_revisions r ON r.node_id=n.id AND r.revision=n.current_revision WHERE n.effort_id=? ORDER BY n.created_at")
+            .bind(effort_id).fetch_all(&mut *tx).await?.into_iter().map(row_to_node).collect::<Result<_,_>>()?;
+        let before_claims = sqlx::query("SELECT c.* FROM claims c JOIN nodes n ON n.id=c.node_id WHERE n.effort_id=? ORDER BY c.claimed_at")
+            .bind(effort_id).fetch_all(&mut *tx).await?.into_iter().map(row_to_claim).collect();
         for mutation in mutations {
             let event = match mutation {
                 BatchMutation::InsertNode {
@@ -873,6 +895,17 @@ impl Store {
                         sqlx::query("UPDATE claims SET released_at=?,release_reason='node resolved' WHERE node_id=? AND released_at IS NULL")
                             .bind(&node.updated_at).bind(&node.id).execute(&mut *tx).await?;
                     }
+                    event
+                }
+                BatchMutation::ChallengeNode {
+                    node,
+                    revision,
+                    event,
+                } => {
+                    sqlx::query("UPDATE nodes SET validity=?,current_revision=?,updated_at=? WHERE id=? AND effort_id=?")
+                        .bind(node.validity.as_str()).bind(node.current_revision).bind(&node.updated_at)
+                        .bind(&node.id).bind(effort_id).execute(&mut *tx).await?;
+                    insert_revision(&mut tx, revision).await?;
                     event
                 }
                 BatchMutation::InsertEdge { edge, event } => {
@@ -948,7 +981,7 @@ impl Store {
         let claims = sqlx::query("SELECT c.* FROM claims c JOIN nodes n ON n.id=c.node_id WHERE n.effort_id=? ORDER BY c.claimed_at")
             .bind(effort_id).fetch_all(&mut *tx).await?.into_iter().map(row_to_claim).collect();
         tx.commit().await?;
-        Ok((version, nodes, claims))
+        Ok((version, before_nodes, before_claims, nodes, claims))
     }
 
     pub async fn graduate_fog(
@@ -1029,7 +1062,7 @@ impl Store {
         &self,
         effort_id: &str,
         include_events: bool,
-        include_revisions: bool,
+        node_id: Option<&str>,
     ) -> Result<
         (
             Effort,
@@ -1037,6 +1070,7 @@ impl Store {
             Vec<Source>,
             Vec<AuditEvent>,
             Vec<NodeRevision>,
+            Vec<(String, String)>,
         ),
         StoreError,
     > {
@@ -1102,14 +1136,20 @@ impl Store {
                 .into_iter()
                 .map(row_to_criterion)
                 .collect::<Result<_, _>>()?;
-        let source_rows = sqlx::query("SELECT ns.node_id,ns.source_id FROM node_sources ns JOIN nodes n ON n.id=ns.node_id WHERE n.effort_id=?")
+        let source_rows = sqlx::query("SELECT ns.node_id,ns.source_id,ns.relationship FROM node_sources ns JOIN nodes n ON n.id=ns.node_id WHERE n.effort_id=? ORDER BY ns.node_id,ns.source_id,ns.relationship")
             .bind(effort_id).fetch_all(&mut *tx).await?;
         let mut node_source_ids = std::collections::HashMap::new();
+        let mut source_relationships = Vec::new();
         for row in source_rows {
+            let row_node_id: String = row.get("node_id");
+            let source_id: String = row.get("source_id");
+            if node_id == Some(row_node_id.as_str()) {
+                source_relationships.push((source_id.clone(), row.get("relationship")));
+            }
             node_source_ids
-                .entry(row.get("node_id"))
+                .entry(row_node_id)
                 .or_insert_with(Vec::new)
-                .push(row.get("source_id"));
+                .push(source_id);
         }
         let mut events = if include_events {
             sqlx::query("SELECT * FROM events WHERE effort_id=?")
@@ -1132,9 +1172,14 @@ impl Store {
             .into_iter()
             .map(row_to_source)
             .collect::<Result<Vec<_>, _>>()?;
-        let revisions = if include_revisions {
-            sqlx::query("SELECT r.* FROM node_revisions r JOIN nodes n ON n.id=r.node_id WHERE n.effort_id=? ORDER BY r.node_id,r.revision")
-                .bind(effort_id).fetch_all(&mut *tx).await?.into_iter().map(row_to_revision).collect::<Result<Vec<_>, _>>()?
+        let revisions = if let Some(node_id) = node_id {
+            sqlx::query("SELECT * FROM node_revisions WHERE node_id=? ORDER BY revision")
+                .bind(node_id)
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .map(row_to_revision)
+                .collect::<Result<Vec<_>, _>>()?
         } else {
             vec![]
         };
@@ -1153,6 +1198,7 @@ impl Store {
             sources,
             events,
             revisions,
+            source_relationships,
         ))
     }
 
@@ -1887,6 +1933,58 @@ mod tests {
             store.get_node("effort", "node").await.unwrap().lifecycle,
             Lifecycle::Open
         );
+    }
+
+    #[tokio::test]
+    async fn batch_challenge_does_not_restore_a_released_claim_lifecycle() {
+        let directory = TempDir::new().unwrap();
+        let store = Store::connect(&directory.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces(id,name,root_uri,schema_version,created_at,updated_at) VALUES('workspace','test','test',1,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO efforts(id,workspace_id,slug,title,destination,status,version,created_at,updated_at) VALUES('effort','workspace','test','test','test','active',1,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO nodes(id,effort_id,kind,title,lifecycle,validity,current_revision,created_at,updated_at) VALUES('node','effort','action','test','in_progress','current',0,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO node_revisions(node_id,revision,body,payload_json,actor_id,created_at) VALUES('node',0,'','{}','test','now')")
+            .execute(&store.pool).await.unwrap();
+
+        let mut stale = store.get_node("effort", "node").await.unwrap();
+        stale.validity = Validity::Challenged;
+        stale.current_revision = 1;
+        sqlx::query("UPDATE nodes SET lifecycle='open' WHERE id='node'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let revision = NodeRevision {
+            node_id: stale.id.clone(),
+            revision: stale.current_revision,
+            body: String::new(),
+            payload: json!({}),
+            reason: Some("challenged".into()),
+            actor_id: "test".into(),
+            session_id: None,
+            created_at: "later".into(),
+        };
+
+        let (_, before_nodes, _, nodes, _) = store
+            .apply_batch(
+                "effort",
+                1,
+                &[BatchMutation::ChallengeNode {
+                    node: stale,
+                    revision,
+                    event: None,
+                }],
+                "later",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(before_nodes[0].lifecycle, Lifecycle::Open);
+        assert_eq!(nodes[0].lifecycle, Lifecycle::Open);
+        assert_eq!(nodes[0].validity, Validity::Challenged);
     }
 
     #[tokio::test]

@@ -443,6 +443,7 @@ Threadmark distinguishes **suspected contradiction**, **accepted contradiction**
 4. Acceptance creates a `contradicts` edge and marks both current nodes `challenged` unless already in a stronger invalid state.
 5. A focused question or experiment should normally be created to reconcile the claims.
 6. Adjudication may reaffirm both claims with clarified scope, invalidate one claim, split a claim, or retain an unresolved contradiction.
+7. Resolving an accepted contradiction requires reconciling its challenged endpoints in the same atomic batch before marking the finding resolved.
 
 The core never asks an LLM on its own. A host agent may use `threadmark contradiction candidates` or the MCP equivalent to fetch likely comparison sets, run its own analysis, and submit proposals.
 

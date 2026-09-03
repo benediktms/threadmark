@@ -197,9 +197,15 @@ pub struct NodeExplanation {
     pub node: Node,
     pub edges: Vec<Edge>,
     pub related_nodes: Vec<Node>,
-    pub sources: Vec<Source>,
+    pub sources: Vec<SourceAttachment>,
     pub revisions: Vec<NodeRevision>,
     pub findings: Vec<Finding>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct SourceAttachment {
+    pub source: Source,
+    pub relationship: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -581,8 +587,8 @@ impl Service {
         ApplicationError,
     > {
         let effort = self.get_effort(effort).await?;
-        let (effort, graph, sources, events, _) =
-            self.store.snapshot_bundle(&effort.id, true, false).await?;
+        let (effort, graph, sources, events, _, _) =
+            self.store.snapshot_bundle(&effort.id, true, None).await?;
         Ok((effort, graph, sources, events))
     }
 
@@ -591,8 +597,8 @@ impl Service {
         effort: &str,
     ) -> Result<(Effort, GraphSnapshot, Vec<threadmark_domain::Source>), ApplicationError> {
         let effort = self.get_effort(effort).await?;
-        let (effort, graph, sources, _, _) =
-            self.store.snapshot_bundle(&effort.id, false, false).await?;
+        let (effort, graph, sources, _, _, _) =
+            self.store.snapshot_bundle(&effort.id, false, None).await?;
         Ok((effort, graph, sources))
     }
 
@@ -653,9 +659,12 @@ impl Service {
         selector: &str,
     ) -> Result<NodeExplanation, ApplicationError> {
         let effort = self.get_effort(effort).await?;
-        let (effort, graph, sources, _, revisions) =
-            self.store.snapshot_bundle(&effort.id, false, true).await?;
-        let node = select_node(&graph.nodes, selector)?.clone();
+        let selected = self.store.get_node(&effort.id, selector).await?;
+        let (effort, graph, sources, _, revisions, source_relationships) = self
+            .store
+            .snapshot_bundle(&effort.id, false, Some(&selected.id))
+            .await?;
+        let node = select_node(&graph.nodes, &selected.id)?.clone();
         let edges = graph
             .edges
             .into_iter()
@@ -671,19 +680,24 @@ impl Service {
                 })
             })
             .collect();
-        let source_ids = graph.node_source_ids.get(&node.id);
-        let sources = sources
+        let sources = source_relationships
             .into_iter()
-            .filter(|source| source_ids.is_some_and(|ids| ids.contains(&source.id)))
-            .collect();
+            .map(|(source_id, relationship)| {
+                let source = sources
+                    .iter()
+                    .find(|source| source.id == source_id)
+                    .cloned()
+                    .ok_or(StoreError::NotFound)?;
+                Ok(SourceAttachment {
+                    source,
+                    relationship,
+                })
+            })
+            .collect::<Result<Vec<_>, ApplicationError>>()?;
         let findings = graph
             .findings
             .into_iter()
             .filter(|finding| finding.related_nodes.contains(&node.id))
-            .collect();
-        let revisions = revisions
-            .into_iter()
-            .filter(|revision| revision.node_id == node.id)
             .collect();
         debug_assert_eq!(effort.id, node.effort_id);
         Ok(NodeExplanation {
@@ -1504,7 +1518,7 @@ impl Service {
         }
         let effort = self.active_effort(&input.effort).await?;
         let mut graph = self.store.snapshot(&effort.id).await?;
-        let before = graph.clone();
+        let mut before = graph.clone();
         let mut sources = self.store.list_sources(&effort.id).await?;
         let mut ids = HashMap::new();
         let mut findings_created = Vec::new();
@@ -1841,7 +1855,7 @@ impl Service {
         }
         validate_accepted_contradictions(&graph)?;
 
-        let (effort_version, nodes, claims) = self
+        let (effort_version, before_nodes, before_claims, nodes, claims) = self
             .store
             .apply_batch(
                 &effort.id,
@@ -1850,6 +1864,8 @@ impl Service {
                 &timestamp,
             )
             .await?;
+        before.nodes = before_nodes;
+        before.claims = before_claims;
         graph.nodes = nodes;
         graph.claims = claims;
         Ok((
@@ -1944,12 +1960,14 @@ fn reject_dependency_cycle(graph: &GraphSnapshot) -> Result<(), ApplicationError
 }
 
 fn validate_accepted_contradictions(graph: &GraphSnapshot) -> Result<(), ApplicationError> {
-    for finding in graph.findings.iter().filter(|finding| {
-        finding.finding_type == FindingType::Contradiction
-            && finding.status == FindingStatus::Accepted
-    }) {
+    for finding in graph
+        .findings
+        .iter()
+        .filter(|finding| finding.finding_type == FindingType::Contradiction)
+    {
         for node_id in &finding.related_nodes {
-            if select_node(&graph.nodes, node_id)?.validity == Validity::Current {
+            let validity = select_node(&graph.nodes, node_id)?.validity;
+            if finding.status == FindingStatus::Accepted && validity == Validity::Current {
                 return Err(DomainError::InvalidState(format!(
                     "accepted contradiction {} still has a current endpoint",
                     finding.id
@@ -1999,6 +2017,16 @@ fn prepare_adjudication(
         ))
         .into());
     }
+    if before.finding_type == FindingType::Contradiction && outcome == FindingStatus::Resolved {
+        for node_id in &before.related_nodes {
+            if select_node(&graph.nodes, node_id)?.validity == Validity::Challenged {
+                return Err(DomainError::InvalidState(
+                    "reconcile challenged endpoints before resolving the contradiction".into(),
+                )
+                .into());
+            }
+        }
+    }
 
     let mut affected_nodes = Vec::new();
     let mut edge_id = None;
@@ -2033,7 +2061,22 @@ fn prepare_adjudication(
         };
         edge_id = Some(edge.id.clone());
         graph.edges.push(edge.clone());
-        mutations.push(BatchMutation::InsertEdge { edge, event: None });
+        let audit = event(
+            Some(effort_id),
+            actor_id,
+            Some(session_id),
+            "edge_created",
+            "edge",
+            &edge.id,
+            None,
+            Some(serde_json::to_value(&edge)?),
+            Some(rationale.clone()),
+            timestamp,
+        );
+        mutations.push(BatchMutation::InsertEdge {
+            edge,
+            event: Some(audit),
+        });
 
         for node_id in [&left.id, &right.id] {
             let node = graph
@@ -2044,7 +2087,7 @@ fn prepare_adjudication(
             if node.validity != Validity::Current {
                 continue;
             }
-            let before_node = serde_json::to_value(&*node)?;
+            let before_validity = node.validity;
             node.validity = Validity::Challenged;
             node.current_revision += 1;
             node.updated_at = timestamp.into();
@@ -2057,15 +2100,14 @@ fn prepare_adjudication(
                 "node_challenged",
                 "node",
                 &node.id,
-                Some(before_node),
-                Some(serde_json::to_value(&*node)?),
+                Some(json!({"validity":before_validity})),
+                Some(json!({"validity":node.validity})),
                 Some(rationale.clone()),
                 timestamp,
             );
-            mutations.push(BatchMutation::UpdateNode {
+            mutations.push(BatchMutation::ChallengeNode {
                 node: node.clone(),
                 revision,
-                claimant: None,
                 event: Some(audit),
             });
         }

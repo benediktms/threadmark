@@ -1583,6 +1583,7 @@ mod tests {
         assert_eq!(result["effort_version"], 2);
         assert_eq!(result["ids"].as_object().unwrap().len(), 4);
         let first = result["ids"]["e1"].as_str().unwrap();
+        let second = result["ids"]["e2"].as_str().unwrap();
         let question = result["ids"]["q1"].as_str().unwrap();
         let finding = result["findings_created"][0].as_str().unwrap();
 
@@ -1594,6 +1595,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(explanation["sources"].as_array().unwrap().len(), 1);
+        assert_eq!(explanation["sources"][0]["relationship"], "supports");
+        assert_eq!(explanation["sources"][0]["source"]["title"], "Source");
         assert_eq!(explanation["edges"].as_array().unwrap().len(), 1);
         assert_eq!(explanation["findings"].as_array().unwrap().len(), 1);
         assert_eq!(explanation["revisions"].as_array().unwrap().len(), 1);
@@ -1654,6 +1657,66 @@ mod tests {
                 && event.entity_type == "node"
                 && event.entity_id == first
         }));
+        assert!(
+            history
+                .iter()
+                .any(|event| { event.event_type == "edge_created" && event.entity_type == "edge" })
+        );
+
+        assert!(
+            call_tool(
+                &service,
+                "resolve_node",
+                &json!({
+                    "effort":"batch",
+                    "node":first,
+                    "body":"Reaffirmed",
+                    "reason":"Reviewed",
+                    "expected_version":3
+                }),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            call_tool(
+                &service,
+                "adjudicate_finding",
+                &json!({
+                    "effort":"batch",
+                    "finding":finding,
+                    "outcome":"resolved",
+                    "rationale":"Done",
+                    "actor_id":"test",
+                    "session_id":"session",
+                    "expected_version":3
+                }),
+            )
+            .await
+            .is_err()
+        );
+        let (unchanged, graph) = service.snapshot("batch").await.unwrap();
+        assert_eq!(unchanged.version, 3);
+        assert_eq!(graph.findings[0].status, FindingStatus::Accepted);
+
+        let reconciled = call_tool(
+            &service,
+            "apply_batch",
+            &json!({
+                "effort":"batch",
+                "actor_id":"test",
+                "session_id":"session",
+                "expected_effort_version":3,
+                "operations":[
+                    {"op":"resolve_node","node":first,"body":"Clarified first scope","reason":"Reconciled"},
+                    {"op":"resolve_node","node":second,"body":"Clarified second scope","reason":"Reconciled"},
+                    {"op":"adjudicate_finding","finding":finding,"outcome":"resolved","rationale":"Scopes clarified"}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reconciled["effort_version"], 4);
 
         call_tool(
             &service,
@@ -1669,7 +1732,7 @@ mod tests {
                 "effort":"batch",
                 "actor_id":"test",
                 "session_id":"session",
-                "expected_effort_version":3,
+                "expected_effort_version":4,
                 "operations":[
                     {"op":"resolve_node","node":question,"body":"Resolved","reason":"Answered"}
                 ]
@@ -1677,7 +1740,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(resolved["effort_version"], 4);
+        assert_eq!(resolved["effort_version"], 5);
         assert!(
             resolved["frontier_after"]
                 .as_array()
@@ -1697,7 +1760,7 @@ mod tests {
                 "effort":"batch",
                 "actor_id":"test",
                 "session_id":"session",
-                "expected_effort_version":4,
+                "expected_effort_version":5,
                 "operations":[
                     {"op":"add_node","temp_id":"e3","value":{"kind":"evidence","title":"Third","summary":"","body":"third","payload":{},"lifecycle":"resolved"}},
                     {"op":"add_edge","source":"e1","type":"informs","target":"e2"},
@@ -1708,7 +1771,7 @@ mod tests {
         .await;
         assert!(failed.is_err());
         let (effort, graph) = service.snapshot("batch").await.unwrap();
-        assert_eq!(effort.version, 4);
+        assert_eq!(effort.version, 5);
         assert_eq!(graph.nodes.len(), 3);
         assert_eq!(graph.edges.len(), 2);
     }
