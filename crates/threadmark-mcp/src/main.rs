@@ -3,10 +3,10 @@ use std::{env, path::PathBuf, str::FromStr};
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{Value, json};
-use threadmark_application::{AddEdge, AddNode, CreateEffort, ReopenEffort, Service};
+use threadmark_application::{AddEdge, AddNode, CreateEffort, Pagination, ReopenEffort, Service};
 use threadmark_domain::{
-    Confidence, EdgeType, Lifecycle, NewEdge, NewNode, NodeKind, RiskLevel, SourceKind,
-    SourceTrust, Validity,
+    Confidence, EdgeType, EventFilter, Lifecycle, NewEdge, NewNode, NodeKind, RiskLevel,
+    SourceKind, SourceTrust, Validity,
 };
 use threadmark_export::{PortableEffort, render_handoff};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -136,16 +136,34 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
             Ok(serde_json::to_value(service.status(effort).await?)?)
         }
         "threadmark_get_snapshot" => {
-            let (effort, graph) = service.snapshot(required(args, "effort")?).await?;
-            let sources = service.sources(&effort.slug).await?;
+            let (effort, graph, sources) = service
+                .snapshot_with_sources(required(args, "effort")?)
+                .await?;
             Ok(json!({"effort":effort,"graph":graph,"sources":sources}))
         }
         "threadmark_get_history" => {
             let effort = required(args, "effort")?;
+            let page = pagination(args)?;
             if let Some(node) = args.get("node").and_then(Value::as_str) {
-                Ok(json!({"revisions": service.node_history(effort, node).await?}))
+                let (revisions, next) = service.node_history_page(effort, node, page).await?;
+                Ok(json!({"revisions":revisions,"next_cursor":next.map(|value| value.to_string())}))
             } else {
-                Ok(json!({"events": service.effort_history(effort).await?}))
+                let (events, next) = service
+                    .effort_history_page(
+                        effort,
+                        EventFilter {
+                            entity_type: optional_string(args, "entity_type"),
+                            entity_id: optional_string(args, "entity_id"),
+                            actor_id: optional_string(args, "actor_id"),
+                            event_type: optional_string(args, "event_type"),
+                            occurred_from: optional_string(args, "occurred_from"),
+                            occurred_to: optional_string(args, "occurred_to"),
+                            ..EventFilter::default()
+                        },
+                        page,
+                    )
+                    .await?;
+                Ok(json!({"events":events,"next_cursor":next.map(|value| value.to_string())}))
             }
         }
         "threadmark_get_frontier" => {
@@ -265,7 +283,7 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                     required(args, "description")?.into(),
                     args.get("anchor").and_then(Value::as_str).map(Into::into),
                     required(args, "actor_id")?,
-                    args.get("expected_version").and_then(Value::as_i64),
+                    Some(required_i64(args, "expected_version")?),
                 )
                 .await?;
             Ok(json!({"fog":fog,"effort_version":version}))
@@ -278,7 +296,7 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                     required(args, "fog")?,
                     &targets,
                     required(args, "actor_id")?,
-                    args.get("expected_version").and_then(Value::as_i64),
+                    Some(required_i64(args, "expected_version")?),
                 )
                 .await?;
             Ok(
@@ -359,7 +377,7 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                     required(args, "detail")?.into(),
                     severity,
                     required(args, "actor_id")?,
-                    args.get("expected_version").and_then(Value::as_i64),
+                    Some(required_i64(args, "expected_version")?),
                 )
                 .await?;
             Ok(json!({"finding":finding,"effort_version":version}))
@@ -431,8 +449,7 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
 }
 
 async fn portable_effort(service: &Service, effort: &str) -> Result<PortableEffort> {
-    let (effort, graph) = service.snapshot(effort).await?;
-    let sources = service.sources(&effort.slug).await?;
+    let (effort, graph, sources) = service.snapshot_with_sources(effort).await?;
     Ok(PortableEffort {
         format_version: 1,
         effort,
@@ -485,10 +502,10 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "threadmark_get_history",
-            "Get effort events or one node's revisions",
+            "Get a filtered page of effort events or one node's revisions",
             object(
                 &["effort"],
-                json!({"effort":{"type":"string"},"node":{"type":"string"}}),
+                json!({"effort":{"type":"string"},"node":{"type":"string"},"entity_type":{"type":"string"},"entity_id":{"type":"string"},"actor_id":{"type":"string"},"event_type":{"type":"string"},"occurred_from":{"type":"string"},"occurred_to":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":"string"}}),
             ),
         ),
         tool(
@@ -568,7 +585,13 @@ fn tool_definitions() -> Vec<Value> {
             "threadmark_add_fog",
             "Record an active fog patch",
             object(
-                &["effort", "title", "description", "actor_id"],
+                &[
+                    "effort",
+                    "title",
+                    "description",
+                    "actor_id",
+                    "expected_version",
+                ],
                 json!({"effort":{"type":"string"},"title":{"type":"string"},"description":{"type":"string"},"anchor":{"type":"string"},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
             ),
         ),
@@ -576,7 +599,7 @@ fn tool_definitions() -> Vec<Value> {
             "threadmark_graduate_fog",
             "Graduate a fog patch to concrete nodes",
             object(
-                &["effort", "fog", "to", "actor_id"],
+                &["effort", "fog", "to", "actor_id", "expected_version"],
                 json!({"effort":{"type":"string"},"fog":{"type":"string"},"to":{"type":"array","items":{"type":"string"},"minItems":1},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
             ),
         ),
@@ -600,7 +623,14 @@ fn tool_definitions() -> Vec<Value> {
             "threadmark_propose_contradiction",
             "Propose a contradiction finding between two nodes",
             object(
-                &["effort", "left", "right", "detail", "actor_id"],
+                &[
+                    "effort",
+                    "left",
+                    "right",
+                    "detail",
+                    "actor_id",
+                    "expected_version",
+                ],
                 json!({"effort":{"type":"string"},"left":{"type":"string"},"right":{"type":"string"},"detail":{"type":"string"},"severity":{"type":"string"},"actor_id":{"type":"string"},"expected_version":{"type":"integer"}}),
             ),
         ),
@@ -697,6 +727,34 @@ fn required<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
         .with_context(|| format!("missing string argument: {key}"))
+}
+
+fn required_i64(args: &Value, key: &str) -> Result<i64> {
+    args.get(key)
+        .and_then(Value::as_i64)
+        .with_context(|| format!("missing integer argument: {key}"))
+}
+
+fn optional_string(args: &Value, key: &str) -> Option<String> {
+    args.get(key).and_then(Value::as_str).map(Into::into)
+}
+
+fn pagination(args: &Value) -> Result<Pagination> {
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(100);
+    anyhow::ensure!(
+        (1..=500).contains(&limit),
+        "limit must be between 1 and 500"
+    );
+    let offset = args
+        .get("cursor")
+        .and_then(Value::as_str)
+        .unwrap_or("0")
+        .parse::<u32>()
+        .context("invalid history cursor")?;
+    Ok(Pagination {
+        limit: limit as u32,
+        offset,
+    })
 }
 
 fn required_strings(args: &Value, key: &str) -> Result<Vec<String>> {
@@ -908,7 +966,25 @@ mod tests {
         let effort_history = call_tool(
             &service,
             "threadmark_get_history",
-            &json!({"effort": "parity"}),
+            &json!({"effort": "parity", "limit": 2}),
+        )
+        .await
+        .unwrap();
+        let effort_history_next = call_tool(
+            &service,
+            "threadmark_get_history",
+            &json!({
+                "effort": "parity",
+                "limit": 2,
+                "cursor": effort_history["next_cursor"],
+            }),
+        )
+        .await
+        .unwrap();
+        let filtered_history = call_tool(
+            &service,
+            "threadmark_get_history",
+            &json!({"effort": "parity", "event_type": "effort_created"}),
         )
         .await
         .unwrap();
@@ -931,7 +1007,10 @@ mod tests {
         assert_eq!(snapshot["graph"]["nodes"].as_array().unwrap().len(), 2);
         assert_eq!(snapshot["graph"]["fog_patches"][0]["status"], "graduated");
         assert_eq!(snapshot["graph"]["findings"].as_array().unwrap().len(), 1);
-        assert!(effort_history["events"].as_array().unwrap().len() >= 6);
+        assert_eq!(effort_history["events"].as_array().unwrap().len(), 2);
+        assert!(effort_history["next_cursor"].is_string());
+        assert_eq!(effort_history_next["events"].as_array().unwrap().len(), 2);
+        assert_eq!(filtered_history["events"].as_array().unwrap().len(), 1);
         assert_eq!(node_history["revisions"].as_array().unwrap().len(), 1);
         assert!(handoff["handoff"].as_str().unwrap().contains("MCP parity"));
         for name in [
@@ -944,6 +1023,22 @@ mod tests {
             "threadmark_render_handoff",
         ] {
             assert!(tool_definitions().iter().any(|tool| tool["name"] == name));
+        }
+        for name in [
+            "threadmark_add_fog",
+            "threadmark_graduate_fog",
+            "threadmark_propose_contradiction",
+        ] {
+            let definition = tool_definitions()
+                .into_iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            assert!(
+                definition["inputSchema"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("expected_version"))
+            );
         }
     }
 

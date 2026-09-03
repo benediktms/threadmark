@@ -13,6 +13,12 @@ use threadmark_domain::{
     GraphSnapshot, Lifecycle, Node, NodeRevision, Reversibility, RiskLevel, Source, Uncertainty,
     Workspace,
 };
+
+#[derive(Clone, Copy, Debug)]
+pub struct Pagination {
+    pub limit: u32,
+    pub offset: u32,
+}
 use time::{
     Duration as TimeDuration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339,
 };
@@ -383,6 +389,31 @@ impl Store {
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(row_to_revision).collect()
+    }
+
+    pub async fn list_revisions_page(
+        &self,
+        node_id: &str,
+        page: Pagination,
+    ) -> Result<(Vec<NodeRevision>, Option<u32>), StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM node_revisions WHERE node_id=? ORDER BY revision LIMIT ? OFFSET ?",
+        )
+        .bind(node_id)
+        .bind(page.limit + 1)
+        .bind(page.offset)
+        .fetch_all(&self.pool)
+        .await?;
+        let has_more = rows.len() > page.limit as usize;
+        let revisions = rows
+            .into_iter()
+            .take(page.limit as usize)
+            .map(row_to_revision)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((
+            revisions,
+            has_more.then_some(page.offset.saturating_add(page.limit)),
+        ))
     }
 
     pub async fn insert_edge(
@@ -774,9 +805,10 @@ impl Store {
         })
     }
 
-    pub async fn snapshot_with_events(
+    pub async fn snapshot_bundle(
         &self,
         effort_id: &str,
+        include_events: bool,
     ) -> Result<(Effort, GraphSnapshot, Vec<Source>, Vec<AuditEvent>), StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         reap_expired_claims(&mut tx, effort_id).await?;
@@ -849,14 +881,20 @@ impl Store {
                 .or_insert_with(Vec::new)
                 .push(row.get("source_id"));
         }
-        let mut events = sqlx::query("SELECT * FROM events WHERE effort_id=?")
-            .bind(effort_id)
-            .fetch_all(&mut *tx)
-            .await?
-            .into_iter()
-            .map(row_to_event)
-            .collect::<Result<Vec<_>, _>>()?;
-        sort_events(&mut events)?;
+        let mut events = if include_events {
+            sqlx::query("SELECT * FROM events WHERE effort_id=?")
+                .bind(effort_id)
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .map(row_to_event)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            vec![]
+        };
+        if include_events {
+            sort_events(&mut events)?;
+        }
         let sources = sqlx::query("SELECT * FROM sources WHERE effort_id=? ORDER BY created_at")
             .bind(effort_id)
             .fetch_all(&mut *tx)
@@ -917,6 +955,24 @@ impl Store {
         workspace_id: &str,
         filter: &EventFilter,
     ) -> Result<Vec<AuditEvent>, StoreError> {
+        Ok(self.query_events(workspace_id, filter, None).await?.0)
+    }
+
+    pub async fn list_events_page(
+        &self,
+        workspace_id: &str,
+        filter: &EventFilter,
+        page: Pagination,
+    ) -> Result<(Vec<AuditEvent>, Option<u32>), StoreError> {
+        self.query_events(workspace_id, filter, Some(page)).await
+    }
+
+    async fn query_events(
+        &self,
+        workspace_id: &str,
+        filter: &EventFilter,
+        page: Option<Pagination>,
+    ) -> Result<(Vec<AuditEvent>, Option<u32>), StoreError> {
         let occurred_from = filter
             .occurred_from
             .as_deref()
@@ -955,13 +1011,19 @@ impl Store {
         if let Some(value) = &occurred_to_candidate {
             query.push(" AND events.occurred_at<").push_bind(value);
         }
-        let rows = query
-            .push(" ORDER BY events.occurred_at,events.id")
-            .build()
-            .fetch_all(&self.pool)
-            .await?;
+        query.push(" ORDER BY events.occurred_at,events.id");
+        if let Some(page) = page {
+            query
+                .push(" LIMIT ")
+                .push_bind(page.limit + 1)
+                .push(" OFFSET ")
+                .push_bind(page.offset);
+        }
+        let rows = query.build().fetch_all(&self.pool).await?;
+        let has_more = page.is_some_and(|page| rows.len() > page.limit as usize);
+        let row_limit = page.map_or(rows.len(), |page| page.limit as usize);
         let mut events = Vec::with_capacity(rows.len());
-        for row in rows {
+        for row in rows.into_iter().take(row_limit) {
             let event = row_to_event(row)?;
             let occurred_at = parse_timestamp(&event.occurred_at)?;
             if occurred_from.is_some_and(|bound| occurred_at < bound)
@@ -973,7 +1035,10 @@ impl Store {
         }
         let mut events = events.into_iter().map(|(_, event)| event).collect();
         sort_events(&mut events)?;
-        Ok(events)
+        let next_offset = page
+            .filter(|_| has_more)
+            .map(|page| page.offset.saturating_add(page.limit));
+        Ok((events, next_offset))
     }
 
     pub async fn list_sources(&self, effort_id: &str) -> Result<Vec<Source>, StoreError> {

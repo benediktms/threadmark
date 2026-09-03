@@ -18,6 +18,7 @@ use threadmark_domain::{
     NodeRevision, ReadinessReport, RiskLevel, Source, SourceKind, SourceTrust, Validity, Workspace,
     calculate_frontier, evaluate_readiness, lint_graph, preview_invalidation, validate_edge,
 };
+pub use threadmark_store::Pagination;
 use threadmark_store::{ClaimGuard, Store, StoreError};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use ulid::Ulid;
@@ -436,7 +437,16 @@ impl Service {
         ApplicationError,
     > {
         let effort = self.get_effort(effort).await?;
-        Ok(self.store.snapshot_with_events(&effort.id).await?)
+        Ok(self.store.snapshot_bundle(&effort.id, true).await?)
+    }
+
+    pub async fn snapshot_with_sources(
+        &self,
+        effort: &str,
+    ) -> Result<(Effort, GraphSnapshot, Vec<threadmark_domain::Source>), ApplicationError> {
+        let effort = self.get_effort(effort).await?;
+        let (effort, graph, sources, _) = self.store.snapshot_bundle(&effort.id, false).await?;
+        Ok((effort, graph, sources))
     }
 
     pub async fn status(&self, effort: &str) -> Result<EffortStatusView, ApplicationError> {
@@ -486,12 +496,39 @@ impl Service {
         Ok(self.store.list_revisions(&node.id).await?)
     }
 
+    pub async fn node_history_page(
+        &self,
+        effort: &str,
+        node: &str,
+        page: Pagination,
+    ) -> Result<(Vec<NodeRevision>, Option<u32>), ApplicationError> {
+        let node = self.get_node(effort, node).await?;
+        Ok(self.store.list_revisions_page(&node.id, page).await?)
+    }
+
     pub async fn effort_history(&self, effort: &str) -> Result<Vec<AuditEvent>, ApplicationError> {
         self.history(EventFilter {
             effort_id: Some(effort.into()),
             ..EventFilter::default()
         })
         .await
+    }
+
+    pub async fn effort_history_page(
+        &self,
+        effort: &str,
+        mut filter: EventFilter,
+        page: Pagination,
+    ) -> Result<(Vec<AuditEvent>, Option<u32>), ApplicationError> {
+        let effort = self.get_effort(effort).await?;
+        if effort.status == EffortStatus::Active {
+            self.store.reap_expired_claims(&effort.id).await?;
+        }
+        filter.effort_id = Some(effort.id);
+        Ok(self
+            .store
+            .list_events_page(&self.workspace.id, &filter, page)
+            .await?)
     }
 
     pub async fn history(
