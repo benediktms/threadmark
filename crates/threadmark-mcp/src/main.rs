@@ -8,10 +8,10 @@ use threadmark_application::{
     AddEdge, AddNode, CreateEffort, EventCursor, EventPage, Pagination, ReopenEffort, Service,
 };
 use threadmark_domain::{
-    Confidence, EdgeType, EventFilter, Lifecycle, NewEdge, NewNode, NodeKind, RiskLevel,
-    SourceKind, SourceTrust, Validity,
+    Confidence, EdgeType, EventFilter, GraphSnapshot, Lifecycle, NewEdge, NewNode, NodeKind,
+    RiskLevel, SourceKind, SourceTrust, Validity,
 };
-use threadmark_export::{PortableEffort, render_handoff};
+use threadmark_export::{PortableEffort, render_handoff_section};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing_subscriber::EnvFilter;
 
@@ -26,6 +26,7 @@ struct Args {
 struct SnapshotCursor {
     version: i64,
     event_rowid: i64,
+    claims_version: i64,
     section: String,
     offset: u32,
 }
@@ -148,26 +149,8 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
         }
         "threadmark_get_snapshot" => {
             let section = required(args, "section")?;
-            let (page, expected_snapshot) = snapshot_page(args, section)?;
-            let (effort, items, next_offset, event_rowid) = service
-                .snapshot_section(required(args, "effort")?, section, page)
-                .await?;
-            if let Some((expected_version, expected_event_rowid)) = expected_snapshot {
-                anyhow::ensure!(
-                    expected_version == effort.version && expected_event_rowid == event_rowid,
-                    "snapshot changed between pages"
-                );
-            }
-            let next_cursor = next_offset
-                .map(|offset| {
-                    serde_json::to_string(&SnapshotCursor {
-                        version: effort.version,
-                        event_rowid,
-                        section: section.into(),
-                        offset,
-                    })
-                })
-                .transpose()?;
+            let (effort, items, next_cursor) =
+                snapshot_section_page(service, args, section).await?;
             Ok(json!({"effort":effort,"section":section,"items":items,"next_cursor":next_cursor}))
         }
         "threadmark_get_history" => {
@@ -474,22 +457,71 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                 .await?;
             Ok(json!({"preview":preview,"effort_version":version}))
         }
-        "threadmark_render_handoff" => Ok(json!({
-            "handoff": render_handoff(&portable_effort(service, required(args, "effort")?).await?)
-        })),
+        "threadmark_render_handoff" => render_handoff_page(service, args).await,
         _ => anyhow::bail!("unknown Threadmark tool: {name}"),
     }
 }
 
-async fn portable_effort(service: &Service, effort: &str) -> Result<PortableEffort> {
-    let (effort, graph, sources) = service.snapshot_with_sources(effort).await?;
-    Ok(PortableEffort {
+async fn render_handoff_page(service: &Service, args: &Value) -> Result<Value> {
+    let section = required(args, "section")?;
+    let effort_selector = required(args, "effort")?;
+    let (effort, items, next_cursor) = if section == "overview" {
+        (service.get_effort(effort_selector).await?, vec![], None)
+    } else {
+        snapshot_section_page(service, args, section).await?
+    };
+    let mut graph = GraphSnapshot::default();
+    match section {
+        "overview" => {}
+        "nodes" => graph.nodes = serde_json::from_value(Value::Array(items))?,
+        "findings" => graph.findings = serde_json::from_value(Value::Array(items))?,
+        "fog_patches" => graph.fog_patches = serde_json::from_value(Value::Array(items))?,
+        "edges" => graph.edges = serde_json::from_value(Value::Array(items))?,
+        _ => anyhow::bail!("unknown handoff section: {section}"),
+    }
+    let package = PortableEffort {
         format_version: 1,
         effort,
         graph,
-        sources,
+        sources: vec![],
         events: vec![],
-    })
+    };
+    Ok(json!({
+        "handoff": render_handoff_section(&package, section).expect("validated handoff section"),
+        "section": section,
+        "next_cursor": next_cursor,
+    }))
+}
+
+async fn snapshot_section_page(
+    service: &Service,
+    args: &Value,
+    section: &str,
+) -> Result<(threadmark_domain::Effort, Vec<Value>, Option<String>)> {
+    let (page, expected_snapshot) = snapshot_page(args, section)?;
+    let (effort, items, next_offset, event_rowid, claims_version) = service
+        .snapshot_section(required(args, "effort")?, section, page)
+        .await?;
+    if let Some(expected) = expected_snapshot {
+        anyhow::ensure!(
+            expected.version == effort.version
+                && expected.event_rowid == event_rowid
+                && expected.claims_version == claims_version,
+            "snapshot changed between pages"
+        );
+    }
+    let next_cursor = next_offset
+        .map(|offset| {
+            serde_json::to_string(&SnapshotCursor {
+                version: effort.version,
+                event_rowid,
+                claims_version,
+                section: section.into(),
+                offset,
+            })
+        })
+        .transpose()?;
+    Ok((effort, items, next_cursor))
 }
 
 fn tool_definitions() -> Vec<Value> {
@@ -704,8 +736,11 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "threadmark_render_handoff",
-            "Render the deterministic implementation handoff",
-            object(&["effort"], json!({"effort":{"type":"string"}})),
+            "Render one bounded section of the deterministic implementation handoff",
+            object(
+                &["effort", "section"],
+                json!({"effort":{"type":"string"},"section":{"type":"string","enum":["overview","nodes","findings","fog_patches","edges"]},"limit":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":"string"}}),
+            ),
         ),
     ]
 }
@@ -810,7 +845,7 @@ fn event_page(args: &Value) -> Result<EventPage> {
     })
 }
 
-fn snapshot_page(args: &Value, section: &str) -> Result<(Pagination, Option<(i64, i64)>)> {
+fn snapshot_page(args: &Value, section: &str) -> Result<(Pagination, Option<SnapshotCursor>)> {
     let cursor = args
         .get("cursor")
         .and_then(Value::as_str)
@@ -824,7 +859,7 @@ fn snapshot_page(args: &Value, section: &str) -> Result<(Pagination, Option<(i64
                 limit: page_limit(args)?,
                 offset: cursor.offset,
             },
-            Some((cursor.version, cursor.event_rowid)),
+            Some(cursor),
         ))
     } else {
         Ok((
@@ -1085,6 +1120,48 @@ mod tests {
         )
         .await
         .unwrap();
+        let source = call_tool(
+            &service,
+            "threadmark_add_source",
+            &json!({
+                "effort": "parity",
+                "kind": "url",
+                "title": "Review source",
+                "uri": "https://example.com/source",
+                "actor_id": "agent",
+                "expected_version": 7,
+            }),
+        )
+        .await
+        .unwrap();
+        call_tool(
+            &service,
+            "threadmark_attach_source",
+            &json!({
+                "effort": "parity",
+                "node": first["node"]["id"],
+                "source": source["source"]["id"],
+                "relationship": "supports",
+                "actor_id": "agent",
+                "expected_version": 8,
+            }),
+        )
+        .await
+        .unwrap();
+        call_tool(
+            &service,
+            "threadmark_attach_source",
+            &json!({
+                "effort": "parity",
+                "node": first["node"]["id"],
+                "source": source["source"]["id"],
+                "relationship": "contradicts",
+                "actor_id": "agent",
+                "expected_version": 9,
+            }),
+        )
+        .await
+        .unwrap();
         let stale_snapshot = call_tool(
             &service,
             "threadmark_get_snapshot",
@@ -1102,6 +1179,13 @@ mod tests {
             &service,
             "threadmark_get_snapshot",
             &json!({"effort": "parity", "section": "findings"}),
+        )
+        .await
+        .unwrap();
+        let snapshot_node_sources = call_tool(
+            &service,
+            "threadmark_get_snapshot",
+            &json!({"effort": "parity", "section": "node_sources"}),
         )
         .await
         .unwrap();
@@ -1140,10 +1224,53 @@ mod tests {
         let handoff = call_tool(
             &service,
             "threadmark_render_handoff",
-            &json!({"effort": "parity"}),
+            &json!({"effort": "parity", "section": "nodes", "limit": 1}),
         )
         .await
         .unwrap();
+        let handoff_next = call_tool(
+            &service,
+            "threadmark_render_handoff",
+            &json!({"effort": "parity", "section": "nodes", "limit": 1, "cursor": handoff["next_cursor"]}),
+        )
+        .await
+        .unwrap();
+        let claimant = harness_claimant();
+        let first_claim = service
+            .claim_node(
+                "parity",
+                first["node"]["id"].as_str().unwrap(),
+                &claimant,
+                30,
+            )
+            .await
+            .unwrap();
+        service
+            .claim_node(
+                "parity",
+                second["node"]["id"].as_str().unwrap(),
+                &claimant,
+                30,
+            )
+            .await
+            .unwrap();
+        let claims = call_tool(
+            &service,
+            "threadmark_get_snapshot",
+            &json!({"effort": "parity", "section": "claims", "limit": 1}),
+        )
+        .await
+        .unwrap();
+        service
+            .heartbeat_claim(&first_claim.id, &claimant, 30)
+            .await
+            .unwrap();
+        let stale_claims = call_tool(
+            &service,
+            "threadmark_get_snapshot",
+            &json!({"effort": "parity", "section": "claims", "limit": 1, "cursor": claims["next_cursor"]}),
+        )
+        .await;
 
         assert_eq!(effort["status"], "active");
         assert_eq!(snapshot_nodes["items"].as_array().unwrap().len(), 1);
@@ -1153,12 +1280,25 @@ mod tests {
         assert_eq!(snapshot_fog["items"][0]["status"], "graduated");
         assert_eq!(graduated["graduated_to"], json!([second["node"]["id"]]));
         assert_eq!(snapshot_findings["items"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            snapshot_node_sources["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["relationship"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["contradicts", "supports"]
+        );
         assert_eq!(effort_history["events"].as_array().unwrap().len(), 2);
         assert!(effort_history["next_cursor"].is_string());
         assert_eq!(effort_history_next["events"].as_array().unwrap().len(), 2);
         assert_eq!(filtered_history["events"].as_array().unwrap().len(), 1);
         assert_eq!(node_history["revisions"].as_array().unwrap().len(), 1);
-        assert!(handoff["handoff"].as_str().unwrap().contains("MCP parity"));
+        assert!(handoff["handoff"].as_str().unwrap().contains("First"));
+        assert!(!handoff["handoff"].as_str().unwrap().contains("Second"));
+        assert!(handoff["next_cursor"].is_string());
+        assert!(handoff_next["handoff"].as_str().unwrap().contains("Second"));
+        assert!(stale_claims.is_err());
         for name in [
             "threadmark_create_effort",
             "threadmark_get_snapshot",

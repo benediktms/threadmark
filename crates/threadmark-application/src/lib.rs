@@ -469,7 +469,7 @@ impl Service {
         effort: &str,
         section: &str,
         page: Pagination,
-    ) -> Result<(Effort, Vec<Value>, Option<u32>, i64), ApplicationError> {
+    ) -> Result<(Effort, Vec<Value>, Option<u32>, i64, i64), ApplicationError> {
         let effort = self.get_effort(effort).await?;
         Ok(self
             .store

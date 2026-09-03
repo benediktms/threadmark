@@ -615,6 +615,19 @@ impl Store {
             .fetch_one(&mut *tx)
             .await?;
         let claim = row_to_claim(row);
+        let effort_id: String = sqlx::query_scalar(
+            "SELECT nodes.effort_id FROM claims JOIN nodes ON nodes.id=claims.node_id WHERE claims.id=?",
+        )
+        .bind(claim_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO store_metadata(key,value) VALUES(?, '1') \
+             ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1",
+        )
+        .bind(format!("claims_version:{effort_id}"))
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(claim)
     }
@@ -941,7 +954,7 @@ impl Store {
         effort_id: &str,
         section: &str,
         page: Pagination,
-    ) -> Result<(Effort, Vec<Value>, Option<u32>, i64), StoreError> {
+    ) -> Result<(Effort, Vec<Value>, Option<u32>, i64, i64), StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         reap_expired_claims(&mut tx, effort_id).await?;
         let effort = row_to_effort(
@@ -955,6 +968,12 @@ impl Store {
                 .bind(effort_id)
                 .fetch_one(&mut *tx)
                 .await?;
+        let claims_version: i64 = sqlx::query_scalar(
+            "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM store_metadata WHERE key=?),0)",
+        )
+        .bind(format!("claims_version:{effort_id}"))
+        .fetch_one(&mut *tx)
+        .await?;
         let limit = page.limit.saturating_add(1);
         let mut items = match section {
             "nodes" => sqlx::query("SELECT n.*,r.body,r.payload_json FROM nodes n JOIN node_revisions r ON r.node_id=n.id AND r.revision=n.current_revision WHERE n.effort_id=? ORDER BY n.created_at,n.id LIMIT ? OFFSET ?")
@@ -997,16 +1016,16 @@ impl Store {
             "sources" => sqlx::query("SELECT * FROM sources WHERE effort_id=? ORDER BY created_at,id LIMIT ? OFFSET ?")
                 .bind(effort_id).bind(limit).bind(page.offset).fetch_all(&mut *tx).await?
                 .into_iter().map(row_to_source).map(|value| value.map(|value| serde_json::to_value(value).expect("source serializes"))).collect::<Result<_,_>>()?,
-            "node_sources" => sqlx::query("SELECT ns.node_id,ns.source_id FROM node_sources ns JOIN nodes n ON n.id=ns.node_id WHERE n.effort_id=? ORDER BY ns.node_id,ns.source_id LIMIT ? OFFSET ?")
+            "node_sources" => sqlx::query("SELECT ns.node_id,ns.source_id,ns.relationship FROM node_sources ns JOIN nodes n ON n.id=ns.node_id WHERE n.effort_id=? ORDER BY ns.node_id,ns.source_id,ns.relationship LIMIT ? OFFSET ?")
                 .bind(effort_id).bind(limit).bind(page.offset).fetch_all(&mut *tx).await?
-                .into_iter().map(|row| json!({"node_id":row.get::<String,_>("node_id"),"source_id":row.get::<String,_>("source_id")})).collect(),
+                .into_iter().map(|row| json!({"node_id":row.get::<String,_>("node_id"),"source_id":row.get::<String,_>("source_id"),"relationship":row.get::<String,_>("relationship")})).collect(),
             _ => return Err(StoreError::NotFound),
         };
         let has_more = items.len() > page.limit as usize;
         items.truncate(page.limit as usize);
         let next = has_more.then_some(page.offset.saturating_add(page.limit));
         tx.commit().await?;
-        Ok((effort, items, next, event_rowid))
+        Ok((effort, items, next, event_rowid, claims_version))
     }
 
     pub async fn list_fog(&self, effort_id: &str) -> Result<Vec<FogPatch>, StoreError> {
