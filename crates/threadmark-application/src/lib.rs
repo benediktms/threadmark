@@ -18,8 +18,8 @@ use threadmark_domain::{
     NodeRevision, ReadinessReport, RiskLevel, Source, SourceKind, SourceTrust, Validity, Workspace,
     calculate_frontier, evaluate_readiness, lint_graph, preview_invalidation, validate_edge,
 };
-pub use threadmark_store::Pagination;
 use threadmark_store::{ClaimGuard, Store, StoreError};
+pub use threadmark_store::{EventCursor, EventPage, Pagination};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use ulid::Ulid;
 
@@ -449,6 +449,19 @@ impl Service {
         Ok((effort, graph, sources))
     }
 
+    pub async fn snapshot_section(
+        &self,
+        effort: &str,
+        section: &str,
+        page: Pagination,
+    ) -> Result<(Effort, Vec<Value>, Option<u32>, i64), ApplicationError> {
+        let effort = self.get_effort(effort).await?;
+        Ok(self
+            .store
+            .snapshot_section(&effort.id, section, page)
+            .await?)
+    }
+
     pub async fn status(&self, effort: &str) -> Result<EffortStatusView, ApplicationError> {
         let effort = self.get_effort(effort).await?;
         self.store.reap_expired_claims(&effort.id).await?;
@@ -518,8 +531,8 @@ impl Service {
         &self,
         effort: &str,
         mut filter: EventFilter,
-        page: Pagination,
-    ) -> Result<(Vec<AuditEvent>, Option<u32>), ApplicationError> {
+        page: EventPage,
+    ) -> Result<(Vec<AuditEvent>, Option<EventCursor>), ApplicationError> {
         let effort = self.get_effort(effort).await?;
         if effort.status == EffortStatus::Active {
             self.store.reap_expired_claims(&effort.id).await?;

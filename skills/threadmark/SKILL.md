@@ -123,7 +123,8 @@ handoff to the configured tracker, not a new Threadmark graph or an execution DA
 
 1. Load `threadmark_render_handoff`, then use the snapshot and history tools for
    any resolved decisions, constraints, provenance, or dependency detail needed
-   for implementation.
+   for implementation. Read snapshot sections and history pages through their
+   continuation cursors instead of assuming one response is complete.
 2. Search the tracker for existing work before proposing new tickets. Reuse or
    relate matching work instead of duplicating it.
 3. Split by independently implementable, reviewable outcomes in delivery order.

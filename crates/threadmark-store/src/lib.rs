@@ -2,7 +2,8 @@
 
 use std::{path::Path, str::FromStr, time::Duration};
 
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sqlx::{
     QueryBuilder, Row, Sqlite, SqlitePool, Transaction,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow},
@@ -18,6 +19,20 @@ use threadmark_domain::{
 pub struct Pagination {
     pub limit: u32,
     pub offset: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EventCursor {
+    pub occurred_at: String,
+    pub id: String,
+    pub through_rowid: i64,
+    pub filter: EventFilter,
+}
+
+#[derive(Clone, Debug)]
+pub struct EventPage {
+    pub limit: u32,
+    pub cursor: Option<EventCursor>,
 }
 use time::{
     Duration as TimeDuration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339,
@@ -52,6 +67,8 @@ pub enum StoreError {
     ClaimNotOwned(String),
     #[error("effort version conflict: expected {expected}, actual {actual}")]
     VersionConflict { expected: i64, actual: i64 },
+    #[error("history cursor filters changed")]
+    CursorFilterMismatch,
 }
 
 #[derive(Clone, Debug)]
@@ -919,6 +936,79 @@ impl Store {
         ))
     }
 
+    pub async fn snapshot_section(
+        &self,
+        effort_id: &str,
+        section: &str,
+        page: Pagination,
+    ) -> Result<(Effort, Vec<Value>, Option<u32>, i64), StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        reap_expired_claims(&mut tx, effort_id).await?;
+        let effort = row_to_effort(
+            sqlx::query("SELECT * FROM efforts WHERE id=?")
+                .bind(effort_id)
+                .fetch_one(&mut *tx)
+                .await?,
+        )?;
+        let event_rowid =
+            sqlx::query_scalar("SELECT COALESCE(MAX(rowid),0) FROM events WHERE effort_id=?")
+                .bind(effort_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let limit = page.limit.saturating_add(1);
+        let mut items = match section {
+            "nodes" => sqlx::query("SELECT n.*,r.body,r.payload_json FROM nodes n JOIN node_revisions r ON r.node_id=n.id AND r.revision=n.current_revision WHERE n.effort_id=? ORDER BY n.created_at,n.id LIMIT ? OFFSET ?")
+                .bind(effort_id).bind(limit).bind(page.offset).fetch_all(&mut *tx).await?
+                .into_iter().map(row_to_node).map(|value| value.map(|value| serde_json::to_value(value).expect("node serializes"))).collect::<Result<_,_>>()?,
+            "edges" => sqlx::query("SELECT * FROM edges WHERE effort_id=? ORDER BY created_at,id LIMIT ? OFFSET ?")
+                .bind(effort_id).bind(limit).bind(page.offset).fetch_all(&mut *tx).await?
+                .into_iter().map(row_to_edge).map(|value| value.map(|value| serde_json::to_value(value).expect("edge serializes"))).collect::<Result<_,_>>()?,
+            "claims" => sqlx::query("SELECT c.* FROM claims c JOIN nodes n ON n.id=c.node_id WHERE n.effort_id=? ORDER BY c.claimed_at,c.id LIMIT ? OFFSET ?")
+                .bind(effort_id).bind(limit).bind(page.offset).fetch_all(&mut *tx).await?
+                .into_iter().map(row_to_claim).map(|value| serde_json::to_value(value).expect("claim serializes")).collect(),
+            "fog_patches" => {
+                let rows = sqlx::query("SELECT * FROM fog_patches WHERE effort_id=? ORDER BY created_at,id LIMIT ? OFFSET ?")
+                    .bind(effort_id).bind(limit).bind(page.offset).fetch_all(&mut *tx).await?;
+                let mut items = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let id: String = row.get("id");
+                    let graduated_to = sqlx::query("SELECT node_id FROM fog_graduations WHERE fog_id=? ORDER BY node_id")
+                        .bind(&id).fetch_all(&mut *tx).await?.into_iter().map(|row| row.get("node_id")).collect();
+                    items.push(serde_json::to_value(FogPatch {
+                        id,
+                        effort_id: row.get("effort_id"),
+                        title: row.get("title"),
+                        description: row.get("description"),
+                        anchor_node_id: row.get("anchor_node_id"),
+                        status: parse("fog.status", row.get::<String, _>("status"))?,
+                        graduated_to,
+                        created_at: row.get("created_at"),
+                        updated_at: row.get("updated_at"),
+                    }).expect("fog patch serializes"));
+                }
+                items
+            }
+            "findings" => sqlx::query("SELECT * FROM findings WHERE effort_id=? ORDER BY created_at,id LIMIT ? OFFSET ?")
+                .bind(effort_id).bind(limit).bind(page.offset).fetch_all(&mut *tx).await?
+                .into_iter().map(row_to_finding).map(|value| value.map(|value| serde_json::to_value(value).expect("finding serializes"))).collect::<Result<_,_>>()?,
+            "exit_criteria" => sqlx::query("SELECT * FROM exit_criteria WHERE effort_id=? ORDER BY created_at,id LIMIT ? OFFSET ?")
+                .bind(effort_id).bind(limit).bind(page.offset).fetch_all(&mut *tx).await?
+                .into_iter().map(row_to_criterion).map(|value| value.map(|value| serde_json::to_value(value).expect("criterion serializes"))).collect::<Result<_,_>>()?,
+            "sources" => sqlx::query("SELECT * FROM sources WHERE effort_id=? ORDER BY created_at,id LIMIT ? OFFSET ?")
+                .bind(effort_id).bind(limit).bind(page.offset).fetch_all(&mut *tx).await?
+                .into_iter().map(row_to_source).map(|value| value.map(|value| serde_json::to_value(value).expect("source serializes"))).collect::<Result<_,_>>()?,
+            "node_sources" => sqlx::query("SELECT ns.node_id,ns.source_id FROM node_sources ns JOIN nodes n ON n.id=ns.node_id WHERE n.effort_id=? ORDER BY ns.node_id,ns.source_id LIMIT ? OFFSET ?")
+                .bind(effort_id).bind(limit).bind(page.offset).fetch_all(&mut *tx).await?
+                .into_iter().map(|row| json!({"node_id":row.get::<String,_>("node_id"),"source_id":row.get::<String,_>("source_id")})).collect(),
+            _ => return Err(StoreError::NotFound),
+        };
+        let has_more = items.len() > page.limit as usize;
+        items.truncate(page.limit as usize);
+        let next = has_more.then_some(page.offset.saturating_add(page.limit));
+        tx.commit().await?;
+        Ok((effort, items, next, event_rowid))
+    }
+
     pub async fn list_fog(&self, effort_id: &str) -> Result<Vec<FogPatch>, StoreError> {
         let rows = sqlx::query("SELECT * FROM fog_patches WHERE effort_id=? ORDER BY created_at")
             .bind(effort_id)
@@ -962,8 +1052,8 @@ impl Store {
         &self,
         workspace_id: &str,
         filter: &EventFilter,
-        page: Pagination,
-    ) -> Result<(Vec<AuditEvent>, Option<u32>), StoreError> {
+        page: EventPage,
+    ) -> Result<(Vec<AuditEvent>, Option<EventCursor>), StoreError> {
         self.query_events(workspace_id, filter, Some(page)).await
     }
 
@@ -971,8 +1061,8 @@ impl Store {
         &self,
         workspace_id: &str,
         filter: &EventFilter,
-        page: Option<Pagination>,
-    ) -> Result<(Vec<AuditEvent>, Option<u32>), StoreError> {
+        page: Option<EventPage>,
+    ) -> Result<(Vec<AuditEvent>, Option<EventCursor>), StoreError> {
         let occurred_from = filter
             .occurred_from
             .as_deref()
@@ -985,11 +1075,32 @@ impl Store {
             .transpose()?;
         let occurred_from_candidate = occurred_from.and_then(|value| time_candidate(value, -1));
         let occurred_to_candidate = occurred_to.and_then(|value| time_candidate(value, 1));
+        if page
+            .as_ref()
+            .and_then(|page| page.cursor.as_ref())
+            .is_some_and(|cursor| cursor.filter != *filter)
+        {
+            return Err(StoreError::CursorFilterMismatch);
+        }
         let mut query = QueryBuilder::<Sqlite>::new(
             "SELECT events.* FROM events JOIN efforts ON efforts.id=events.effort_id \
              WHERE efforts.workspace_id=",
         );
         query.push_bind(workspace_id);
+        let through_rowid = match &page {
+            Some(page) => match &page.cursor {
+                Some(cursor) => cursor.through_rowid,
+                None => {
+                    sqlx::query_scalar("SELECT COALESCE(MAX(rowid),0) FROM events")
+                        .fetch_one(&self.pool)
+                        .await?
+                }
+            },
+            None => 0,
+        };
+        if page.is_some() {
+            query.push(" AND events.rowid<=").push_bind(through_rowid);
+        }
         if let Some(value) = &filter.effort_id {
             query.push(" AND events.effort_id=").push_bind(value);
         }
@@ -1011,20 +1122,32 @@ impl Store {
         if let Some(value) = &occurred_to_candidate {
             query.push(" AND events.occurred_at<").push_bind(value);
         }
+        if let Some(cursor) = page.as_ref().and_then(|page| page.cursor.as_ref()) {
+            query
+                .push(" AND (events.occurred_at>")
+                .push_bind(&cursor.occurred_at)
+                .push(" OR (events.occurred_at=")
+                .push_bind(&cursor.occurred_at)
+                .push(" AND events.id>")
+                .push_bind(&cursor.id)
+                .push("))");
+        }
         query.push(" ORDER BY events.occurred_at,events.id");
-        if let Some(page) = page {
+        if let Some(page) = &page {
             query
                 .push(" LIMIT ")
-                .push_bind(page.limit + 1)
-                .push(" OFFSET ")
-                .push_bind(page.offset);
+                .push_bind(page.limit.saturating_add(1));
         }
         let rows = query.build().fetch_all(&self.pool).await?;
-        let has_more = page.is_some_and(|page| rows.len() > page.limit as usize);
-        let row_limit = page.map_or(rows.len(), |page| page.limit as usize);
+        let has_more = page
+            .as_ref()
+            .is_some_and(|page| rows.len() > page.limit as usize);
+        let row_limit = page.as_ref().map_or(rows.len(), |page| page.limit as usize);
         let mut events = Vec::with_capacity(rows.len());
+        let mut last_seen = None;
         for row in rows.into_iter().take(row_limit) {
             let event = row_to_event(row)?;
+            last_seen = Some((event.occurred_at.clone(), event.id.clone()));
             let occurred_at = parse_timestamp(&event.occurred_at)?;
             if occurred_from.is_some_and(|bound| occurred_at < bound)
                 || occurred_to.is_some_and(|bound| occurred_at > bound)
@@ -1035,10 +1158,16 @@ impl Store {
         }
         let mut events = events.into_iter().map(|(_, event)| event).collect();
         sort_events(&mut events)?;
-        let next_offset = page
-            .filter(|_| has_more)
-            .map(|page| page.offset.saturating_add(page.limit));
-        Ok((events, next_offset))
+        let next_cursor = has_more.then(|| {
+            let (occurred_at, id) = last_seen.expect("a full page has a last event");
+            EventCursor {
+                occurred_at,
+                id,
+                through_rowid,
+                filter: filter.clone(),
+            }
+        });
+        Ok((events, next_cursor))
     }
 
     pub async fn list_sources(&self, effort_id: &str) -> Result<Vec<Source>, StoreError> {
@@ -1641,20 +1770,22 @@ mod tests {
             .list_events_page(
                 "workspace",
                 &filter,
-                Pagination {
+                EventPage {
                     limit: 1,
-                    offset: 0,
+                    cursor: None,
                 },
             )
             .await
             .unwrap();
+        sqlx::query("INSERT INTO events(id,effort_id,actor_id,event_type,entity_type,entity_id,occurred_at) VALUES('inserted','effort','test','ordered','node','node','2026-01-01T00:30:00.122000000Z')")
+            .execute(&store.pool).await.unwrap();
         let (second, _) = store
             .list_events_page(
                 "workspace",
                 &filter,
-                Pagination {
+                EventPage {
                     limit: 1,
-                    offset: next.unwrap(),
+                    cursor: next,
                 },
             )
             .await
