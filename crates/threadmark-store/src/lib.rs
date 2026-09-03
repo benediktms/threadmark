@@ -83,6 +83,48 @@ pub enum ClaimGuard<'a> {
     OwnIfClaimed(&'a str),
 }
 
+#[derive(Clone, Debug)]
+pub enum BatchMutation {
+    InsertNode {
+        node: Node,
+        revision: NodeRevision,
+        event: Option<AuditEvent>,
+    },
+    UpdateNode {
+        node: Node,
+        revision: NodeRevision,
+        claimant: Option<String>,
+        event: Option<AuditEvent>,
+    },
+    InsertEdge {
+        edge: Edge,
+        event: Option<AuditEvent>,
+    },
+    InsertSource {
+        source: Source,
+        event: Option<AuditEvent>,
+    },
+    AttachSource {
+        node_id: String,
+        source_id: String,
+        relationship: String,
+        event: Option<AuditEvent>,
+    },
+    GraduateFog {
+        fog_id: String,
+        node_ids: Vec<String>,
+        event: Option<AuditEvent>,
+    },
+    UpdateFinding {
+        finding: Finding,
+        event: Option<AuditEvent>,
+    },
+    InsertFinding {
+        finding: Finding,
+        event: Option<AuditEvent>,
+    },
+}
+
 impl Store {
     pub async fn connect(path: &Path) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent() {
@@ -768,6 +810,139 @@ impl Store {
             .execute(&mut *tx).await?;
         insert_event(&mut tx, event).await?;
         let version = bump_version(&mut tx, &finding.effort_id, &finding.updated_at).await?;
+        tx.commit().await?;
+        Ok(version)
+    }
+
+    pub async fn apply_batch(
+        &self,
+        effort_id: &str,
+        expected_version: i64,
+        mutations: &[BatchMutation],
+        now: &str,
+    ) -> Result<i64, StoreError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let cutoff = reap_expired_claims(&mut tx, effort_id).await?;
+        check_version(&mut tx, effort_id, expected_version).await?;
+        for mutation in mutations {
+            let event = match mutation {
+                BatchMutation::InsertNode {
+                    node,
+                    revision,
+                    event,
+                } => {
+                    sqlx::query("INSERT INTO nodes(id,effort_id,kind,title,summary,lifecycle,validity,confidence,confidence_reason,reversibility,impact,uncertainty,cost_of_wrong,current_revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+                        .bind(&node.id).bind(&node.effort_id).bind(node.kind.as_str()).bind(&node.title)
+                        .bind(&node.summary).bind(node.lifecycle.as_str()).bind(node.validity.as_str())
+                        .bind(node.confidence.map(Confidence::as_str)).bind(&node.confidence_reason)
+                        .bind(node.reversibility.map(Reversibility::as_str)).bind(node.impact.map(RiskLevel::as_str))
+                        .bind(node.uncertainty.map(Uncertainty::as_str)).bind(node.cost_of_wrong.map(RiskLevel::as_str))
+                        .bind(node.current_revision).bind(&node.created_at).bind(&node.updated_at)
+                        .execute(&mut *tx).await?;
+                    insert_revision(&mut tx, revision).await?;
+                    event
+                }
+                BatchMutation::UpdateNode {
+                    node,
+                    revision,
+                    claimant,
+                    event,
+                } => {
+                    if let Some(claimant) = claimant {
+                        let owner: Option<String> = sqlx::query_scalar(
+                            "SELECT claimant FROM claims WHERE node_id=? \
+                             AND released_at IS NULL AND julianday(lease_expires_at)>julianday(?)",
+                        )
+                        .bind(&node.id)
+                        .bind(&cutoff)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                        if owner.as_deref() != Some(claimant) {
+                            return Err(StoreError::ClaimNotOwned(claimant.clone()));
+                        }
+                    }
+                    sqlx::query("UPDATE nodes SET title=?,summary=?,lifecycle=?,validity=?,confidence=?,confidence_reason=?,reversibility=?,impact=?,uncertainty=?,cost_of_wrong=?,current_revision=?,updated_at=? WHERE id=? AND effort_id=?")
+                        .bind(&node.title).bind(&node.summary).bind(node.lifecycle.as_str()).bind(node.validity.as_str())
+                        .bind(node.confidence.map(Confidence::as_str)).bind(&node.confidence_reason)
+                        .bind(node.reversibility.map(Reversibility::as_str)).bind(node.impact.map(RiskLevel::as_str))
+                        .bind(node.uncertainty.map(Uncertainty::as_str)).bind(node.cost_of_wrong.map(RiskLevel::as_str))
+                        .bind(node.current_revision).bind(&node.updated_at).bind(&node.id).bind(effort_id)
+                        .execute(&mut *tx).await?;
+                    insert_revision(&mut tx, revision).await?;
+                    if node.lifecycle == Lifecycle::Resolved {
+                        sqlx::query("UPDATE claims SET released_at=?,release_reason='node resolved' WHERE node_id=? AND released_at IS NULL")
+                            .bind(&node.updated_at).bind(&node.id).execute(&mut *tx).await?;
+                    }
+                    event
+                }
+                BatchMutation::InsertEdge { edge, event } => {
+                    sqlx::query("INSERT INTO edges(id,effort_id,source_node_id,type,target_node_id,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)")
+                        .bind(&edge.id).bind(&edge.effort_id).bind(&edge.source_node_id).bind(edge.edge_type.as_str())
+                        .bind(&edge.target_node_id).bind(&edge.rationale).bind(&edge.created_by).bind(&edge.created_at)
+                        .execute(&mut *tx).await?;
+                    event
+                }
+                BatchMutation::InsertSource { source, event } => {
+                    sqlx::query("INSERT INTO sources(id,effort_id,kind,uri,title,retrieved_at,observed_at,content_hash,excerpt,metadata_json,trust,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+                        .bind(&source.id).bind(&source.effort_id).bind(source.kind.as_str()).bind(&source.uri).bind(&source.title)
+                        .bind(&source.retrieved_at).bind(&source.observed_at).bind(&source.content_hash).bind(&source.excerpt)
+                        .bind(serde_json::to_string(&source.metadata).expect("JSON value serializes")).bind(source.trust.as_str()).bind(&source.created_at)
+                        .execute(&mut *tx).await?;
+                    event
+                }
+                BatchMutation::AttachSource {
+                    node_id,
+                    source_id,
+                    relationship,
+                    event,
+                } => {
+                    sqlx::query(
+                        "INSERT INTO node_sources(node_id,source_id,relationship) VALUES(?,?,?)",
+                    )
+                    .bind(node_id)
+                    .bind(source_id)
+                    .bind(relationship)
+                    .execute(&mut *tx)
+                    .await?;
+                    event
+                }
+                BatchMutation::GraduateFog {
+                    fog_id,
+                    node_ids,
+                    event,
+                } => {
+                    sqlx::query("UPDATE fog_patches SET status='graduated',updated_at=? WHERE id=? AND effort_id=? AND status='active'")
+                        .bind(now).bind(fog_id).bind(effort_id).execute(&mut *tx).await?;
+                    for node_id in node_ids {
+                        sqlx::query("INSERT INTO fog_graduations(fog_id,node_id) VALUES(?,?)")
+                            .bind(fog_id)
+                            .bind(node_id)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                    event
+                }
+                BatchMutation::UpdateFinding { finding, event } => {
+                    sqlx::query("UPDATE findings SET status=?,adjudication=?,updated_at=? WHERE id=? AND effort_id=?")
+                        .bind(finding.status.as_str()).bind(&finding.adjudication).bind(&finding.updated_at)
+                        .bind(&finding.id).bind(effort_id).execute(&mut *tx).await?;
+                    event
+                }
+                BatchMutation::InsertFinding { finding, event } => {
+                    sqlx::query("INSERT INTO findings(id,effort_id,type,severity,status,title,detail,related_nodes_json,proposed_by,adjudication,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+                        .bind(&finding.id).bind(&finding.effort_id).bind(finding.finding_type.as_str()).bind(finding.severity.as_str())
+                        .bind(finding.status.as_str()).bind(&finding.title).bind(&finding.detail)
+                        .bind(serde_json::to_string(&finding.related_nodes).expect("JSON value serializes"))
+                        .bind(&finding.proposed_by).bind(&finding.adjudication).bind(&finding.created_at).bind(&finding.updated_at)
+                        .execute(&mut *tx).await?;
+                    event
+                }
+            };
+            if let Some(event) = event {
+                insert_event(&mut tx, event).await?;
+            }
+        }
+        let version = bump_version(&mut tx, effort_id, now).await?;
         tx.commit().await?;
         Ok(version)
     }

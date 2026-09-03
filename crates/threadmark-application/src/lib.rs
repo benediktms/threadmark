@@ -18,7 +18,7 @@ use threadmark_domain::{
     NodeRevision, ReadinessReport, RiskLevel, Source, SourceKind, SourceTrust, Validity, Workspace,
     calculate_frontier, evaluate_readiness, lint_graph, preview_invalidation, validate_edge,
 };
-use threadmark_store::{ClaimGuard, Store, StoreError};
+use threadmark_store::{BatchMutation, ClaimGuard, Store, StoreError};
 pub use threadmark_store::{EventCursor, EventPage, Pagination};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use ulid::Ulid;
@@ -107,6 +107,99 @@ pub struct AddEdge {
     pub edge: NewEdge,
     pub actor_id: String,
     pub expected_version: Option<i64>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct ApplyBatch {
+    pub effort: String,
+    pub actor_id: String,
+    pub session_id: String,
+    pub expected_effort_version: i64,
+    pub operations: Vec<BatchOperation>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum BatchOperation {
+    AddNode {
+        temp_id: Option<String>,
+        value: NewNode,
+    },
+    AddEdge {
+        source: String,
+        #[serde(rename = "type")]
+        edge_type: threadmark_domain::EdgeType,
+        target: String,
+        rationale: Option<String>,
+    },
+    AddSource {
+        temp_id: Option<String>,
+        kind: SourceKind,
+        title: String,
+        uri: Option<String>,
+        excerpt: Option<String>,
+        trust: Option<SourceTrust>,
+    },
+    AttachSource {
+        node: String,
+        source: String,
+        relationship: String,
+    },
+    ResolveNode {
+        node: String,
+        body: String,
+        payload: Option<Value>,
+        confidence: Option<Confidence>,
+        confidence_reason: Option<String>,
+        reason: String,
+    },
+    GraduateFog {
+        fog: String,
+        to: Vec<String>,
+    },
+    ProposeContradiction {
+        left: String,
+        right: String,
+        detail: String,
+        severity: Option<RiskLevel>,
+    },
+    AdjudicateFinding {
+        finding: String,
+        outcome: FindingStatus,
+        rationale: String,
+    },
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct BatchResult {
+    pub effort_version: i64,
+    pub ids: HashMap<String, String>,
+    pub frontier_before: Vec<FrontierEntry>,
+    pub frontier_after: Vec<FrontierEntry>,
+    pub findings_created: Vec<String>,
+    pub readiness_before: ReadinessReport,
+    pub readiness_after: ReadinessReport,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct AdjudicateFinding {
+    pub effort: String,
+    pub finding: String,
+    pub outcome: FindingStatus,
+    pub rationale: String,
+    pub actor_id: String,
+    pub session_id: String,
+    pub expected_version: i64,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct NodeExplanation {
+    pub node: Node,
+    pub edges: Vec<Edge>,
+    pub related_nodes: Vec<Node>,
+    pub sources: Vec<Source>,
+    pub revisions: Vec<NodeRevision>,
+    pub findings: Vec<Finding>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -549,6 +642,50 @@ impl Service {
     pub async fn get_node(&self, effort: &str, node: &str) -> Result<Node, ApplicationError> {
         let effort = self.get_effort(effort).await?;
         Ok(self.store.get_node(&effort.id, node).await?)
+    }
+
+    pub async fn explain_node(
+        &self,
+        effort: &str,
+        selector: &str,
+    ) -> Result<NodeExplanation, ApplicationError> {
+        let (effort, graph, sources) = self.snapshot_with_sources(effort).await?;
+        let node = select_node(&graph.nodes, selector)?.clone();
+        let edges = graph
+            .edges
+            .into_iter()
+            .filter(|edge| edge.source_node_id == node.id || edge.target_node_id == node.id)
+            .collect::<Vec<_>>();
+        let related_nodes = graph
+            .nodes
+            .into_iter()
+            .filter(|candidate| {
+                edges.iter().any(|edge| {
+                    (edge.source_node_id == node.id && edge.target_node_id == candidate.id)
+                        || (edge.target_node_id == node.id && edge.source_node_id == candidate.id)
+                })
+            })
+            .collect();
+        let source_ids = graph.node_source_ids.get(&node.id);
+        let sources = sources
+            .into_iter()
+            .filter(|source| source_ids.is_some_and(|ids| ids.contains(&source.id)))
+            .collect();
+        let findings = graph
+            .findings
+            .into_iter()
+            .filter(|finding| finding.related_nodes.contains(&node.id))
+            .collect();
+        let revisions = self.store.list_revisions(&node.id).await?;
+        debug_assert_eq!(effort.id, node.effort_id);
+        Ok(NodeExplanation {
+            node,
+            edges,
+            related_nodes,
+            sources,
+            revisions,
+            findings,
+        })
     }
 
     pub async fn node_history(
@@ -1314,6 +1451,596 @@ impl Service {
             .await?;
         Ok((finding, version))
     }
+
+    pub async fn adjudicate_finding(
+        &self,
+        input: AdjudicateFinding,
+    ) -> Result<(Finding, BatchResult), ApplicationError> {
+        let selector = input.finding.clone();
+        let effort = input.effort.clone();
+        let result = self
+            .apply_batch(
+                ApplyBatch {
+                    effort: input.effort,
+                    actor_id: input.actor_id,
+                    session_id: input.session_id,
+                    expected_effort_version: input.expected_version,
+                    operations: vec![BatchOperation::AdjudicateFinding {
+                        finding: input.finding,
+                        outcome: input.outcome,
+                        rationale: input.rationale,
+                    }],
+                },
+                None,
+            )
+            .await?;
+        let (_, graph) = self.snapshot(&effort).await?;
+        Ok((select_finding(&graph.findings, &selector)?.clone(), result))
+    }
+
+    pub async fn apply_batch(
+        &self,
+        input: ApplyBatch,
+        claimant: Option<&str>,
+    ) -> Result<BatchResult, ApplicationError> {
+        if input.operations.is_empty() {
+            return Err(
+                DomainError::InvalidState("batch requires at least one operation".into()).into(),
+            );
+        }
+        let effort = self.active_effort(&input.effort).await?;
+        let mut graph = self.store.snapshot(&effort.id).await?;
+        let before = graph.clone();
+        let mut sources = self.store.list_sources(&effort.id).await?;
+        let mut ids = HashMap::new();
+        let mut findings_created = Vec::new();
+        let mut mutations = Vec::new();
+        let timestamp = now();
+
+        for operation in input.operations {
+            match operation {
+                BatchOperation::AddNode { temp_id, value } => {
+                    let node = Node {
+                        id: id(),
+                        effort_id: effort.id.clone(),
+                        kind: value.kind,
+                        title: value.title,
+                        summary: value.summary,
+                        lifecycle: value.lifecycle,
+                        validity: Validity::Current,
+                        confidence: value.confidence,
+                        confidence_reason: value.confidence_reason,
+                        reversibility: value.reversibility,
+                        impact: value.impact,
+                        uncertainty: value.uncertainty,
+                        cost_of_wrong: value.cost_of_wrong,
+                        current_revision: 1,
+                        body: value.body,
+                        payload: value.payload,
+                        created_at: timestamp.clone(),
+                        updated_at: timestamp.clone(),
+                    };
+                    validate_node(&node)?;
+                    record_temp_id(&mut ids, temp_id, &node.id)?;
+                    let revision = revision(
+                        &node,
+                        &input.actor_id,
+                        Some(&input.session_id),
+                        "initial revision",
+                        &timestamp,
+                    );
+                    let audit = event(
+                        Some(&effort.id),
+                        &input.actor_id,
+                        Some(&input.session_id),
+                        "node_created",
+                        "node",
+                        &node.id,
+                        None,
+                        Some(serde_json::to_value(&node)?),
+                        None,
+                        &timestamp,
+                    );
+                    graph.nodes.push(node.clone());
+                    mutations.push(BatchMutation::InsertNode {
+                        node,
+                        revision,
+                        event: Some(audit),
+                    });
+                }
+                BatchOperation::AddEdge {
+                    source,
+                    edge_type,
+                    target,
+                    rationale,
+                } => {
+                    let source = select_node(&graph.nodes, resolve_temp_id(&ids, &source))?;
+                    let target = select_node(&graph.nodes, resolve_temp_id(&ids, &target))?;
+                    validate_edge(source, edge_type, target)?;
+                    let edge = Edge {
+                        id: id(),
+                        effort_id: effort.id.clone(),
+                        source_node_id: source.id.clone(),
+                        edge_type,
+                        target_node_id: target.id.clone(),
+                        rationale,
+                        created_by: input.actor_id.clone(),
+                        created_at: timestamp.clone(),
+                    };
+                    graph.edges.push(edge.clone());
+                    reject_dependency_cycle(&graph)?;
+                    let audit = event(
+                        Some(&effort.id),
+                        &input.actor_id,
+                        Some(&input.session_id),
+                        "edge_created",
+                        "edge",
+                        &edge.id,
+                        None,
+                        Some(serde_json::to_value(&edge)?),
+                        None,
+                        &timestamp,
+                    );
+                    mutations.push(BatchMutation::InsertEdge {
+                        edge,
+                        event: Some(audit),
+                    });
+                }
+                BatchOperation::AddSource {
+                    temp_id,
+                    kind,
+                    title,
+                    uri,
+                    excerpt,
+                    trust,
+                } => {
+                    if excerpt.as_deref().is_some_and(|value| value.len() > 4_096) {
+                        return Err(DomainError::InvalidState(
+                            "source excerpts are limited to 4096 bytes".into(),
+                        )
+                        .into());
+                    }
+                    let source = Source {
+                        id: id(),
+                        effort_id: effort.id.clone(),
+                        kind,
+                        uri,
+                        title,
+                        retrieved_at: Some(timestamp.clone()),
+                        observed_at: None,
+                        content_hash: None,
+                        excerpt,
+                        metadata: json!({}),
+                        trust: trust.unwrap_or(SourceTrust::Unreviewed),
+                        created_at: timestamp.clone(),
+                    };
+                    record_temp_id(&mut ids, temp_id, &source.id)?;
+                    let audit = event(
+                        Some(&effort.id),
+                        &input.actor_id,
+                        Some(&input.session_id),
+                        "source_created",
+                        "source",
+                        &source.id,
+                        None,
+                        Some(serde_json::to_value(&source)?),
+                        None,
+                        &timestamp,
+                    );
+                    sources.push(source.clone());
+                    mutations.push(BatchMutation::InsertSource {
+                        source,
+                        event: Some(audit),
+                    });
+                }
+                BatchOperation::AttachSource {
+                    node,
+                    source,
+                    relationship,
+                } => {
+                    let node = select_node(&graph.nodes, resolve_temp_id(&ids, &node))?;
+                    let source_id = resolve_temp_id(&ids, &source);
+                    if !sources.iter().any(|source| source.id == source_id) {
+                        return Err(StoreError::NotFound.into());
+                    }
+                    graph
+                        .node_source_ids
+                        .entry(node.id.clone())
+                        .or_default()
+                        .push(source_id.into());
+                    let audit = event(
+                        Some(&effort.id),
+                        &input.actor_id,
+                        Some(&input.session_id),
+                        "source_attached",
+                        "node",
+                        &node.id,
+                        None,
+                        Some(json!({"source_id":source_id,"relationship":relationship})),
+                        None,
+                        &timestamp,
+                    );
+                    mutations.push(BatchMutation::AttachSource {
+                        node_id: node.id.clone(),
+                        source_id: source_id.into(),
+                        relationship,
+                        event: Some(audit),
+                    });
+                }
+                BatchOperation::ResolveNode {
+                    node,
+                    body,
+                    payload,
+                    confidence,
+                    confidence_reason,
+                    reason,
+                } => {
+                    let node_id = select_node(&graph.nodes, resolve_temp_id(&ids, &node))?
+                        .id
+                        .clone();
+                    let node = graph
+                        .nodes
+                        .iter_mut()
+                        .find(|node| node.id == node_id)
+                        .unwrap();
+                    let before = serde_json::to_value(&*node)?;
+                    let required_claimant = node.claimable().then(|| {
+                        claimant.ok_or_else(|| {
+                            DomainError::InvalidState(
+                                "resolving a claimable node in a batch requires claim ownership".into(),
+                            )
+                        })
+                    }).transpose()?;
+                    node.lifecycle = Lifecycle::Resolved;
+                    node.validity = Validity::Current;
+                    node.body = body;
+                    if let Some(payload) = payload {
+                        node.payload = payload;
+                    }
+                    node.confidence = confidence.or(node.confidence);
+                    node.confidence_reason = confidence_reason.or(node.confidence_reason.clone());
+                    node.current_revision += 1;
+                    node.updated_at.clone_from(&timestamp);
+                    validate_node(node)?;
+                    let revision = revision(
+                        node,
+                        &input.actor_id,
+                        Some(&input.session_id),
+                        &reason,
+                        &timestamp,
+                    );
+                    let audit = event(
+                        Some(&effort.id),
+                        &input.actor_id,
+                        Some(&input.session_id),
+                        "node_resolved",
+                        "node",
+                        &node.id,
+                        Some(before),
+                        Some(serde_json::to_value(&*node)?),
+                        Some(reason),
+                        &timestamp,
+                    );
+                    mutations.push(BatchMutation::UpdateNode {
+                        node: node.clone(),
+                        revision,
+                        claimant: required_claimant.map(str::to_owned),
+                        event: Some(audit),
+                    });
+                }
+                BatchOperation::GraduateFog { fog, to } => {
+                    if to.is_empty() {
+                        return Err(DomainError::InvalidState(
+                            "graduated fog requires at least one target node".into(),
+                        )
+                        .into());
+                    }
+                    let node_ids = to
+                        .iter()
+                        .map(|node| {
+                            select_node(&graph.nodes, resolve_temp_id(&ids, node))
+                                .map(|node| node.id.clone())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let fog = select_fog_mut(&mut graph.fog_patches, &fog)?;
+                    if fog.status != FogStatus::Active {
+                        return Err(DomainError::InvalidState("fog is not active".into()).into());
+                    }
+                    fog.status = FogStatus::Graduated;
+                    fog.graduated_to.clone_from(&node_ids);
+                    fog.updated_at.clone_from(&timestamp);
+                    let audit = event(
+                        Some(&effort.id),
+                        &input.actor_id,
+                        Some(&input.session_id),
+                        "fog_graduated",
+                        "fog",
+                        &fog.id,
+                        None,
+                        Some(json!({"nodes":node_ids})),
+                        None,
+                        &timestamp,
+                    );
+                    mutations.push(BatchMutation::GraduateFog {
+                        fog_id: fog.id.clone(),
+                        node_ids,
+                        event: Some(audit),
+                    });
+                }
+                BatchOperation::ProposeContradiction {
+                    left,
+                    right,
+                    detail,
+                    severity,
+                } => {
+                    let left = select_node(&graph.nodes, resolve_temp_id(&ids, &left))?;
+                    let right = select_node(&graph.nodes, resolve_temp_id(&ids, &right))?;
+                    let finding = Finding {
+                        id: id(),
+                        effort_id: effort.id.clone(),
+                        finding_type: FindingType::Contradiction,
+                        severity: severity.unwrap_or(RiskLevel::High),
+                        status: FindingStatus::Proposed,
+                        title: format!("Possible contradiction: {} / {}", left.title, right.title),
+                        detail,
+                        related_nodes: vec![left.id.clone(), right.id.clone()],
+                        proposed_by: Some(input.actor_id.clone()),
+                        adjudication: None,
+                        created_at: timestamp.clone(),
+                        updated_at: timestamp.clone(),
+                    };
+                    let audit = event(
+                        Some(&effort.id),
+                        &input.actor_id,
+                        Some(&input.session_id),
+                        "finding_proposed",
+                        "finding",
+                        &finding.id,
+                        None,
+                        Some(serde_json::to_value(&finding)?),
+                        None,
+                        &timestamp,
+                    );
+                    findings_created.push(finding.id.clone());
+                    graph.findings.push(finding.clone());
+                    mutations.push(BatchMutation::InsertFinding {
+                        finding,
+                        event: Some(audit),
+                    });
+                }
+                BatchOperation::AdjudicateFinding {
+                    finding,
+                    outcome,
+                    rationale,
+                } => prepare_adjudication(
+                    &effort.id,
+                    &input.actor_id,
+                    &input.session_id,
+                    &timestamp,
+                    &mut graph,
+                    &mut mutations,
+                    &finding,
+                    outcome,
+                    rationale,
+                )?,
+            }
+        }
+
+        let effort_version = self
+            .store
+            .apply_batch(
+                &effort.id,
+                input.expected_effort_version,
+                &mutations,
+                &timestamp,
+            )
+            .await?;
+        Ok(BatchResult {
+            effort_version,
+            ids,
+            frontier_before: calculate_frontier(&before, &timestamp),
+            frontier_after: calculate_frontier(&graph, &timestamp),
+            findings_created,
+            readiness_before: evaluate_readiness(&before),
+            readiness_after: evaluate_readiness(&graph),
+        })
+    }
+}
+
+fn record_temp_id(
+    ids: &mut HashMap<String, String>,
+    temp_id: Option<String>,
+    stable_id: &str,
+) -> Result<(), ApplicationError> {
+    let Some(temp_id) = temp_id else {
+        return Ok(());
+    };
+    if temp_id.trim().is_empty() || ids.insert(temp_id.clone(), stable_id.into()).is_some() {
+        return Err(DomainError::InvalidState(format!(
+            "duplicate or empty temporary id: {temp_id}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn resolve_temp_id<'a>(ids: &'a HashMap<String, String>, selector: &'a str) -> &'a str {
+    ids.get(selector).map_or(selector, String::as_str)
+}
+
+fn select_node<'a>(nodes: &'a [Node], selector: &str) -> Result<&'a Node, ApplicationError> {
+    select_by_id(nodes, selector, |node| &node.id)
+}
+
+fn select_finding<'a>(
+    findings: &'a [Finding],
+    selector: &str,
+) -> Result<&'a Finding, ApplicationError> {
+    select_by_id(findings, selector, |finding| &finding.id)
+}
+
+fn select_by_id<'a, T>(
+    values: &'a [T],
+    selector: &str,
+    id: impl Fn(&T) -> &str,
+) -> Result<&'a T, ApplicationError> {
+    if let Some(value) = values.iter().find(|value| id(value) == selector) {
+        return Ok(value);
+    }
+    let mut matches = values
+        .iter()
+        .filter(|value| id(value).starts_with(selector));
+    let value = matches.next().ok_or(StoreError::NotFound)?;
+    if matches.next().is_some() {
+        return Err(StoreError::NotFound.into());
+    }
+    Ok(value)
+}
+
+fn select_fog_mut<'a>(
+    fog: &'a mut [FogPatch],
+    selector: &str,
+) -> Result<&'a mut FogPatch, ApplicationError> {
+    let matches = fog
+        .iter()
+        .enumerate()
+        .filter(|(_, fog)| fog.id == selector || fog.id.starts_with(selector))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(StoreError::NotFound.into());
+    }
+    Ok(&mut fog[matches[0]])
+}
+
+fn reject_dependency_cycle(graph: &GraphSnapshot) -> Result<(), ApplicationError> {
+    if let Some(issue) = lint_graph(graph)
+        .into_iter()
+        .find(|finding| finding.code == "TM004")
+    {
+        return Err(ApplicationError::InvalidGraph(issue.message));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_adjudication(
+    effort_id: &str,
+    actor_id: &str,
+    session_id: &str,
+    timestamp: &str,
+    graph: &mut GraphSnapshot,
+    mutations: &mut Vec<BatchMutation>,
+    selector: &str,
+    outcome: FindingStatus,
+    rationale: String,
+) -> Result<(), ApplicationError> {
+    if rationale.trim().is_empty() {
+        return Err(
+            DomainError::InvalidState("adjudication rationale cannot be empty".into()).into(),
+        );
+    }
+    let finding_id = select_finding(&graph.findings, selector)?.id.clone();
+    let finding_index = graph
+        .findings
+        .iter()
+        .position(|finding| finding.id == finding_id)
+        .expect("selected finding exists");
+    let before = graph.findings[finding_index].clone();
+    let valid_transition = matches!(
+        (before.status, outcome),
+        (
+            FindingStatus::Proposed,
+            FindingStatus::Accepted | FindingStatus::Rejected
+        ) | (FindingStatus::Accepted, FindingStatus::Resolved)
+    );
+    if !valid_transition {
+        return Err(DomainError::InvalidState(format!(
+            "cannot adjudicate finding from {} to {}",
+            before.status, outcome
+        ))
+        .into());
+    }
+
+    let mut affected_nodes = Vec::new();
+    let mut edge_id = None;
+    if outcome == FindingStatus::Accepted && before.finding_type == FindingType::Contradiction {
+        if before.related_nodes.len() != 2 {
+            return Err(DomainError::InvalidState(
+                "contradiction findings require exactly two related nodes".into(),
+            )
+            .into());
+        }
+        let left = select_node(&graph.nodes, &before.related_nodes[0])?.clone();
+        let right = select_node(&graph.nodes, &before.related_nodes[1])?.clone();
+        if graph.edges.iter().any(|edge| {
+            edge.edge_type == threadmark_domain::EdgeType::Contradicts
+                && ((edge.source_node_id == left.id && edge.target_node_id == right.id)
+                    || (edge.source_node_id == right.id && edge.target_node_id == left.id))
+        }) {
+            return Err(DomainError::InvalidState(
+                "contradiction edge already exists for finding".into(),
+            )
+            .into());
+        }
+        let edge = Edge {
+            id: id(),
+            effort_id: effort_id.into(),
+            source_node_id: left.id.clone(),
+            edge_type: threadmark_domain::EdgeType::Contradicts,
+            target_node_id: right.id.clone(),
+            rationale: Some(rationale.clone()),
+            created_by: actor_id.into(),
+            created_at: timestamp.into(),
+        };
+        edge_id = Some(edge.id.clone());
+        graph.edges.push(edge.clone());
+        mutations.push(BatchMutation::InsertEdge { edge, event: None });
+
+        for node_id in [&left.id, &right.id] {
+            let node = graph
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == *node_id)
+                .expect("related node exists");
+            if node.validity != Validity::Current {
+                continue;
+            }
+            node.validity = Validity::Challenged;
+            node.current_revision += 1;
+            node.updated_at = timestamp.into();
+            let revision = revision(node, actor_id, Some(session_id), &rationale, timestamp);
+            affected_nodes.push(node.id.clone());
+            mutations.push(BatchMutation::UpdateNode {
+                node: node.clone(),
+                revision,
+                claimant: None,
+                event: None,
+            });
+        }
+    }
+
+    let finding = &mut graph.findings[finding_index];
+    finding.status = outcome;
+    finding.adjudication = Some(rationale.clone());
+    finding.updated_at = timestamp.into();
+    let audit = event(
+        Some(effort_id),
+        actor_id,
+        Some(session_id),
+        "finding_adjudicated",
+        "finding",
+        &finding.id,
+        Some(serde_json::to_value(before)?),
+        Some(json!({"finding":finding,"edge_id":edge_id,"challenged_nodes":affected_nodes})),
+        Some(rationale),
+        timestamp,
+    );
+    mutations.push(BatchMutation::UpdateFinding {
+        finding: finding.clone(),
+        event: Some(audit),
+    });
+    Ok(())
 }
 
 fn validate_node(node: &Node) -> Result<(), ApplicationError> {

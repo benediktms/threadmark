@@ -2,10 +2,12 @@ use std::{env, path::PathBuf, str::FromStr};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use threadmark_application::{
-    AddEdge, AddNode, CreateEffort, EventCursor, EventPage, Pagination, ReopenEffort, Service,
+    AddEdge, AddNode, AdjudicateFinding, ApplyBatch, CreateEffort, EventCursor, EventPage,
+    Pagination, ReopenEffort, Service,
 };
 use threadmark_domain::{
     Confidence, EdgeType, EventFilter, GraphSnapshot, Lifecycle, NewEdge, NewNode, NodeKind,
@@ -214,6 +216,11 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                 .get_node(required(args, "effort")?, required(args, "node")?)
                 .await?,
         )?),
+        "explain_node" => Ok(serde_json::to_value(
+            service
+                .explain_node(required(args, "effort")?, required(args, "node")?)
+                .await?,
+        )?),
         "get_readiness" => {
             let status = service.status(required(args, "effort")?).await?;
             Ok(serde_json::to_value(status.readiness)?)
@@ -420,6 +427,19 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
                 )
                 .await?;
             Ok(json!({"finding":finding,"effort_version":version}))
+        }
+        "adjudicate_finding" => {
+            let input: AdjudicateFinding = serde_json::from_value(args.clone())?;
+            let (finding, result) = service.adjudicate_finding(input).await?;
+            Ok(json!({"finding":finding,"batch":result}))
+        }
+        "apply_batch" => {
+            let input: ApplyBatch = serde_json::from_value(args.clone())?;
+            Ok(serde_json::to_value(
+                service
+                    .apply_batch(input, Some(&harness_claimant()))
+                    .await?,
+            )?)
         }
         "resolve_node" => {
             let confidence = parse_optional::<Confidence>(args, "confidence")?;
@@ -646,6 +666,14 @@ fn tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
+            "explain_node",
+            "Explain a node through its exact relationships, provenance, findings, and revisions",
+            object(
+                &["effort", "node"],
+                json!({"effort":{"type":"string"},"node":{"type":"string"}}),
+            ),
+        ),
+        tool(
             "get_readiness",
             "Evaluate deterministic exit criteria",
             object(&["effort"], json!({"effort":{"type":"string"}})),
@@ -759,6 +787,16 @@ fn tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
+            "adjudicate_finding",
+            "Accept, reject, or resolve a finding with audited graph effects",
+            input_schema::<AdjudicateFinding>(),
+        ),
+        tool(
+            "apply_batch",
+            "Apply one atomic, version-bound set of agent mutations",
+            input_schema::<ApplyBatch>(),
+        ),
+        tool(
             "resolve_node",
             "Resolve a node and append an immutable revision",
             object(
@@ -803,6 +841,10 @@ fn tool_definitions() -> Vec<Value> {
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     json!({"name":name,"description":description,"inputSchema":input_schema})
+}
+
+fn input_schema<T: JsonSchema>() -> Value {
+    serde_json::to_value(schema_for!(T)).expect("generated input schema serializes")
 }
 
 fn object(required: &[&str], properties: Value) -> Value {
@@ -1499,6 +1541,138 @@ mod tests {
                     .contains(&json!("expected_version"))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn batch_adjudication_and_explanation_are_atomic() {
+        let directory = TempDir::new().unwrap();
+        let service = Service::init(directory.path(), "test").await.unwrap();
+        service
+            .create_effort(CreateEffort {
+                slug: "batch".into(),
+                title: "Batch".into(),
+                destination: "Exercise complete MCP workflows".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+
+        let result = call_tool(
+            &service,
+            "apply_batch",
+            &json!({
+                "effort": "batch",
+                "actor_id": "test",
+                "session_id": "session",
+                "expected_effort_version": 1,
+                "operations": [
+                    {"op":"add_node","temp_id":"e1","value":{"kind":"evidence","title":"First","summary":"","body":"first","payload":{},"lifecycle":"resolved"}},
+                    {"op":"add_node","temp_id":"e2","value":{"kind":"evidence","title":"Second","summary":"","body":"second","payload":{},"lifecycle":"resolved"}},
+                    {"op":"add_node","temp_id":"q1","value":{"kind":"question","title":"Question","summary":"","body":"","payload":{},"lifecycle":"open"}},
+                    {"op":"add_source","temp_id":"s1","kind":"url","title":"Source","uri":"https://example.com","trust":"reviewed"},
+                    {"op":"attach_source","node":"e1","source":"s1","relationship":"supports"},
+                    {"op":"add_edge","source":"e1","type":"supports","target":"e2"},
+                    {"op":"propose_contradiction","left":"e1","right":"e2","detail":"They disagree"}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["effort_version"], 2);
+        assert_eq!(result["ids"].as_object().unwrap().len(), 4);
+        let first = result["ids"]["e1"].as_str().unwrap();
+        let question = result["ids"]["q1"].as_str().unwrap();
+        let finding = result["findings_created"][0].as_str().unwrap();
+
+        let explanation = call_tool(
+            &service,
+            "explain_node",
+            &json!({"effort":"batch","node":first}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(explanation["sources"].as_array().unwrap().len(), 1);
+        assert_eq!(explanation["edges"].as_array().unwrap().len(), 1);
+        assert_eq!(explanation["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(explanation["revisions"].as_array().unwrap().len(), 1);
+
+        let adjudicated = call_tool(
+            &service,
+            "adjudicate_finding",
+            &json!({
+                "effort":"batch",
+                "finding":finding,
+                "outcome":"accepted",
+                "rationale":"The scopes overlap",
+                "actor_id":"test",
+                "session_id":"session",
+                "expected_version":2
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(adjudicated["finding"]["status"], "accepted");
+        assert_eq!(adjudicated["batch"]["effort_version"], 3);
+        let (_, graph) = service.snapshot("batch").await.unwrap();
+        assert_eq!(graph.edges.len(), 2);
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .filter(|node| node.kind == NodeKind::Evidence)
+                .all(|node| node.validity == Validity::Challenged)
+        );
+
+        call_tool(
+            &service,
+            "claim_node",
+            &json!({"effort":"batch","node":question}),
+        )
+        .await
+        .unwrap();
+        let resolved = call_tool(
+            &service,
+            "apply_batch",
+            &json!({
+                "effort":"batch",
+                "actor_id":"test",
+                "session_id":"session",
+                "expected_effort_version":3,
+                "operations":[
+                    {"op":"resolve_node","node":question,"body":"Resolved","reason":"Answered"}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved["effort_version"], 4);
+        assert_eq!(
+            service.get_node("batch", question).await.unwrap().lifecycle,
+            Lifecycle::Resolved
+        );
+
+        let failed = call_tool(
+            &service,
+            "apply_batch",
+            &json!({
+                "effort":"batch",
+                "actor_id":"test",
+                "session_id":"session",
+                "expected_effort_version":4,
+                "operations":[
+                    {"op":"add_node","temp_id":"e3","value":{"kind":"evidence","title":"Third","summary":"","body":"third","payload":{},"lifecycle":"resolved"}},
+                    {"op":"add_edge","source":"e1","type":"informs","target":"e2"},
+                    {"op":"add_edge","source":"e1","type":"informs","target":"e2"}
+                ]
+            }),
+        )
+        .await;
+        assert!(failed.is_err());
+        let (effort, graph) = service.snapshot("batch").await.unwrap();
+        assert_eq!(effort.version, 4);
+        assert_eq!(graph.nodes.len(), 3);
+        assert_eq!(graph.edges.len(), 2);
     }
 
     #[tokio::test]

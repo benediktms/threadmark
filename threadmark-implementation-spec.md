@@ -983,7 +983,6 @@ and do not repeat the `threadmark_` prefix.
 - `explain_node`
 - `get_readiness`
 - `lint`
-- `get_findings`
 - `get_history`
 - `render_handoff`
 
@@ -1032,6 +1031,12 @@ Agents should normally submit one atomic change set after completing an investig
 ```
 
 The server validates the entire batch and either commits all operations or none. Temporary IDs are resolved within the batch. The response includes the new effort version, stable IDs, changed frontier, findings, and readiness delta.
+
+The v1 batch accepts node and edge creation, source creation and attachment, node
+resolution, fog graduation, and contradiction proposal or adjudication. Claims,
+effort lifecycle, and invalidation remain dedicated operations because they have
+separate concurrency or preview contracts. Findings are read through
+`get_snapshot` with the `findings` section rather than a duplicate list tool.
 
 ### 23.5 Context response budget
 

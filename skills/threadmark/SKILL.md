@@ -65,6 +65,9 @@ Gather evidence, record provenance, add any newly exposed questions, then
 resolve only that node with the conclusion, alternatives rejected, confidence,
 and confidence reason. Finish with **Verify**. Independent research nodes may
 be worked in parallel only after the user approves the proposed parallel set.
+Submit related node, edge, source, resolution, fog, and finding changes through
+`apply_batch` so they share one expected effort version and either all commit or
+none do.
 
 After resolving one substantive node, do not silently continue or spawn workers.
 When two or more independent research nodes are actionable, name the proposed
