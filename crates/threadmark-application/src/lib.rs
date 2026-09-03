@@ -123,27 +123,57 @@ impl Service {
         if marker_path.exists() {
             return Self::open(&root).await;
         }
+        let database_path = database_path(&root);
+        fs::create_dir_all(database_path.parent().expect("database has a parent"))?;
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(database_path.with_file_name("init.lock"))?;
+        let _lock = tokio::task::spawn_blocking(move || {
+            lock.lock()?;
+            Ok::<_, std::io::Error>(lock)
+        })
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))??;
+        if marker_path.exists() {
+            return Self::open(&root).await;
+        }
         fs::create_dir_all(root.join(".threadmark/exports"))?;
-        let workspace_id = id();
+        let store = Store::connect(&database_path).await?;
+        let existing = store.first_workspace().await?;
+        let workspace_id = existing
+            .as_ref()
+            .map_or_else(id, |workspace| workspace.id.clone());
+        let name = existing
+            .as_ref()
+            .map_or(name, |workspace| workspace.name.as_str());
         let marker = toml::to_string(&WorkspaceMarker {
             schema_version: SCHEMA_VERSION,
             workspace_id: workspace_id.clone(),
             name: name.into(),
         })
         .map_err(|error| ApplicationError::InvalidMarker(error.to_string()))?;
-        fs::write(&marker_path, marker)?;
         let timestamp = now();
         let workspace = Workspace {
             id: workspace_id,
             name: name.into(),
             root_uri: root.to_string_lossy().into_owned(),
             schema_version: SCHEMA_VERSION,
-            created_at: timestamp.clone(),
+            created_at: existing.as_ref().map_or_else(
+                || timestamp.clone(),
+                |workspace| workspace.created_at.clone(),
+            ),
             updated_at: timestamp,
         };
-        let database_path = database_path(&root);
-        let store = Store::connect(&database_path).await?;
-        store.create_workspace(&workspace).await?;
+        if existing.is_some() {
+            store.reconcile_workspace(&workspace).await?;
+        } else {
+            store.create_workspace(&workspace).await?;
+        }
+        fs::write(&marker_path, marker)?;
+        let workspace = store.get_workspace(&workspace.id).await?;
         Ok(Self {
             root,
             workspace,
@@ -156,24 +186,6 @@ impl Service {
             Ok(service) => Ok(service),
             Err(ApplicationError::NotInitialized(_)) => {
                 let root = project_root(start);
-                fs::create_dir_all(root.join(".threadmark"))?;
-                let lock = fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(root.join(".threadmark/init.lock"))?;
-                let _lock = tokio::task::spawn_blocking(move || {
-                    lock.lock()?;
-                    Ok::<_, std::io::Error>(lock)
-                })
-                .await
-                .map_err(|error| std::io::Error::other(error.to_string()))??;
-                match Self::open(start).await {
-                    Ok(service) => return Ok(service),
-                    Err(ApplicationError::NotInitialized(_)) => {}
-                    Err(error) => return Err(error),
-                }
                 let name = root
                     .file_name()
                     .and_then(|name| name.to_str())

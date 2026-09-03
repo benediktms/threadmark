@@ -37,6 +37,12 @@ struct SnapshotCursor {
     offset: u32,
 }
 
+#[derive(Deserialize, Serialize)]
+struct RevisionCursor {
+    node_id: String,
+    offset: u32,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -163,10 +169,19 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
         }
         "threadmark_get_history" => {
             let effort = required(args, "effort")?;
-            if let Some(node) = args.get("node").and_then(Value::as_str) {
-                let page = revision_page(args)?;
-                let (revisions, next) = service.node_history_page(effort, node, page).await?;
-                Ok(json!({"revisions":revisions,"next_cursor":next.map(|value| value.to_string())}))
+            if let Some(selector) = args.get("node").and_then(Value::as_str) {
+                let node = service.get_node(effort, selector).await?;
+                let page = revision_page(args, &node.id)?;
+                let (revisions, next) = service.node_history_page(effort, &node.id, page).await?;
+                let next_cursor = next
+                    .map(|offset| {
+                        serde_json::to_string(&RevisionCursor {
+                            node_id: node.id.clone(),
+                            offset,
+                        })
+                    })
+                    .transpose()?;
+                Ok(json!({"revisions":revisions,"next_cursor":next_cursor}))
             } else {
                 let page = event_page(args)?;
                 let (events, next) = service
@@ -860,16 +875,19 @@ fn page_limit(args: &Value) -> Result<u32> {
     Ok(limit as u32)
 }
 
-fn revision_page(args: &Value) -> Result<Pagination> {
-    let offset = args
+fn revision_page(args: &Value, node_id: &str) -> Result<Pagination> {
+    let cursor = args
         .get("cursor")
         .and_then(Value::as_str)
-        .unwrap_or("0")
-        .parse::<u32>()
+        .map(serde_json::from_str::<RevisionCursor>)
+        .transpose()
         .context("invalid history cursor")?;
+    if let Some(cursor) = &cursor {
+        anyhow::ensure!(cursor.node_id == node_id, "history cursor node changed");
+    }
     Ok(Pagination {
         limit: page_limit(args)?,
-        offset,
+        offset: cursor.map_or(0, |cursor| cursor.offset),
     })
 }
 
@@ -997,25 +1015,74 @@ mod tests {
 
     #[tokio::test]
     async fn missing_workspace_is_initialized_at_the_git_root() {
-        let repository = TempDir::new().unwrap();
+        let directory = TempDir::new().unwrap();
+        let repository = directory.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
         assert!(
             std::process::Command::new("git")
                 .args(["init", "--quiet"])
-                .current_dir(repository.path())
+                .current_dir(&repository)
                 .status()
                 .unwrap()
                 .success()
         );
-        let child = repository.path().join("nested");
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Threadmark Test",
+                    "-c",
+                    "user.email=threadmark@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    "initial",
+                ])
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let worktree = directory.path().join("worktree");
+        assert!(
+            std::process::Command::new("git")
+                .args(["worktree", "add", "--quiet", "--detach"])
+                .arg(&worktree)
+                .arg("HEAD")
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let child = repository.join("nested");
+        let worktree_child = worktree.join("nested");
         std::fs::create_dir(&child).unwrap();
+        std::fs::create_dir(&worktree_child).unwrap();
 
-        let (first, second) =
-            tokio::join!(Service::open_or_init(&child), Service::open_or_init(&child));
+        let (first, second) = tokio::join!(
+            Service::open_or_init(&child),
+            Service::open_or_init(&worktree_child)
+        );
         let first = first.unwrap();
         let second = second.unwrap();
 
-        assert_eq!(first.root(), repository.path().canonicalize().unwrap());
+        assert_eq!(first.root(), repository.canonicalize().unwrap());
+        assert_eq!(second.root(), worktree.canonicalize().unwrap());
         assert_eq!(second.workspace().id, first.workspace().id);
+        first
+            .create_effort(CreateEffort {
+                slug: "shared".into(),
+                title: "Shared".into(),
+                destination: "Visible from both worktrees".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.list_efforts().await.unwrap().len(), 1);
     }
 
     #[test]
@@ -1156,7 +1223,7 @@ mod tests {
         )
         .await
         .unwrap();
-        call_tool(
+        let third = call_tool(
             &service,
             "threadmark_add_node",
             &json!({
@@ -1207,6 +1274,18 @@ mod tests {
                 "relationship": "contradicts",
                 "actor_id": "agent",
                 "expected_version": 9,
+            }),
+        )
+        .await
+        .unwrap();
+        call_tool(
+            &service,
+            "threadmark_resolve_node",
+            &json!({
+                "effort": "parity",
+                "node": third["node"]["id"],
+                "body": "Resolved evidence",
+                "expected_version": 10,
             }),
         )
         .await
@@ -1266,10 +1345,16 @@ mod tests {
         let node_history = call_tool(
             &service,
             "threadmark_get_history",
-            &json!({"effort": "parity", "node": first["node"]["id"]}),
+            &json!({"effort": "parity", "node": third["node"]["id"], "limit": 1}),
         )
         .await
         .unwrap();
+        let mismatched_node_history = call_tool(
+            &service,
+            "threadmark_get_history",
+            &json!({"effort": "parity", "node": second["node"]["id"], "limit": 1, "cursor": node_history["next_cursor"]}),
+        )
+        .await;
         let handoff_overview = call_tool(
             &service,
             "threadmark_render_handoff",
@@ -1356,6 +1441,8 @@ mod tests {
         assert_eq!(effort_history_next["events"].as_array().unwrap().len(), 2);
         assert_eq!(filtered_history["events"].as_array().unwrap().len(), 1);
         assert_eq!(node_history["revisions"].as_array().unwrap().len(), 1);
+        assert!(node_history["next_cursor"].is_string());
+        assert!(mismatched_node_history.is_err());
         assert!(handoff["handoff"].as_str().unwrap().contains("First"));
         assert!(!handoff["handoff"].as_str().unwrap().contains("Second"));
         assert!(

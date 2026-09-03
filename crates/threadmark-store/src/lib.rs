@@ -238,6 +238,15 @@ impl Store {
         Ok(row_to_workspace(row))
     }
 
+    pub async fn first_workspace(&self) -> Result<Option<Workspace>, StoreError> {
+        Ok(
+            sqlx::query("SELECT * FROM workspaces ORDER BY created_at,id LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await?
+                .map(row_to_workspace),
+        )
+    }
+
     pub async fn create_effort(
         &self,
         effort: &Effort,
