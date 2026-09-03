@@ -970,42 +970,43 @@ It must use graph traversal, not generated prose. Human output may summarize sto
 
 ## 23. MCP server specification
 
-The MCP server runs over stdio in v1. Tool names use the `threadmark_` prefix.
+The MCP server runs over stdio in v1. Tool names rely on the MCP server namespace
+and do not repeat the `threadmark_` prefix.
 
 ### 23.1 Read tools
 
-- `threadmark_list_efforts`
-- `threadmark_get_context`
-- `threadmark_get_snapshot`
-- `threadmark_get_frontier`
-- `threadmark_get_node`
-- `threadmark_explain_node`
-- `threadmark_get_readiness`
-- `threadmark_lint`
-- `threadmark_get_findings`
-- `threadmark_get_history`
-- `threadmark_render_handoff`
+- `list_efforts`
+- `get_context`
+- `get_snapshot`
+- `get_frontier`
+- `get_node`
+- `explain_node`
+- `get_readiness`
+- `lint`
+- `get_findings`
+- `get_history`
+- `render_handoff`
 
 ### 23.2 Claim tools
 
-- `threadmark_claim_next`
-- `threadmark_claim_node`
-- `threadmark_heartbeat_claim`
-- `threadmark_release_claim`
+- `claim_next`
+- `claim_node`
+- `heartbeat_claim`
+- `release_claim`
 
 ### 23.3 Mutation tools
 
-- `threadmark_apply_batch`
-- `threadmark_create_effort`
-- `threadmark_reopen_effort`
-- `threadmark_add_fog`
-- `threadmark_resolve_node`
-- `threadmark_reopen_node`
-- `threadmark_propose_contradiction`
-- `threadmark_adjudicate_finding`
-- `threadmark_preview_invalidation`
-- `threadmark_commit_invalidation`
-- `threadmark_graduate_fog`
+- `apply_batch`
+- `create_effort`
+- `reopen_effort`
+- `add_fog`
+- `resolve_node`
+- `reopen_node`
+- `propose_contradiction`
+- `adjudicate_finding`
+- `preview_invalidation`
+- `commit_invalidation`
+- `graduate_fog`
 
 ### 23.4 Batch mutation
 
@@ -1034,7 +1035,7 @@ The server validates the entire batch and either commits all operations or none.
 
 ### 23.5 Context response budget
 
-`threadmark_get_context` accepts a detail level:
+`get_context` accepts a detail level:
 
 - `low`: destination, scope, readiness blockers, frontier, decision gists, findings, fog counts.
 - `medium`: low plus immediate graph neighborhoods.
