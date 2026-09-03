@@ -64,8 +64,10 @@ Ask one question at a time and wait. When you have a recommendation, state it
 and explain why in one sentence, but never answer for the user. Treat a direct
 answer as confirmation and persist it immediately; ask a follow-up before
 mutation only when the answer is ambiguous, explicitly tentative, or changes
-the question's scope. Record related nodes, edges, sources, resolutions, and fog
-atomically when the MCP supports that combination.
+the question's scope. When persistence resolves a graph node, claim it after
+the answer arrives and immediately before resolving it; do not hold a claim
+while waiting for the user. Record related nodes, edges, sources, resolutions,
+and fog atomically when the MCP supports that combination.
 
 Add precise questions, premises, and decisions as soon as they are nameable;
 connect dependencies with typed edges. Do not invent answers or resolve a

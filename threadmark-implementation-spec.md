@@ -557,7 +557,7 @@ Frontier
 2. Create the effort after the destination is settled, then perform a short read-only orientation to the relevant repository and specification.
 3. Chart every new empty effort through a breadth-first interview in the main user-facing thread. Ask one question at a time and wait for the human's answer.
 4. When the agent has a recommendation, state it with a one-sentence rationale, but never answer on the human's behalf.
-5. Treat a direct answer as confirmation and persist it immediately. Ask a follow-up first only when the answer is ambiguous, explicitly tentative, or changes scope.
+5. Treat a direct answer as confirmation and persist it immediately. Ask a follow-up first only when the answer is ambiguous, explicitly tentative, or changes scope. When persistence resolves a graph node, claim it after the answer arrives and immediately before resolving it; do not hold a claim while waiting for the human.
 6. Record explicit in-scope and out-of-scope boundaries and add structured exit criteria.
 7. Add precise questions, decisions, assumptions, constraints, and experiments as soon as they are nameable; identify them breadth-first rather than pursuing one branch deeply.
 8. Add `requires` edges only where work is genuinely impossible without the prerequisite, and add non-blocking semantic edges separately.
