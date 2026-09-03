@@ -1574,6 +1574,7 @@ mod tests {
                     {"op":"add_source","temp_id":"s1","kind":"url","title":"Source","uri":"https://example.com","trust":"reviewed"},
                     {"op":"attach_source","node":"e1","source":"s1","relationship":"supports"},
                     {"op":"add_edge","source":"e1","type":"supports","target":"e2"},
+                    {"op":"add_edge","source":"e1","type":"contradicts","target":"e2"},
                     {"op":"propose_contradiction","left":"e1","right":"e2","detail":"They disagree"},
                     {"op":"propose_contradiction","left":"e1","right":"e1","detail":"Invalid self contradiction"}
                 ]
@@ -1599,7 +1600,7 @@ mod tests {
         assert_eq!(explanation["sources"].as_array().unwrap().len(), 1);
         assert_eq!(explanation["sources"][0]["relationship"], "supports");
         assert_eq!(explanation["sources"][0]["source"]["title"], "Source");
-        assert_eq!(explanation["edges"].as_array().unwrap().len(), 1);
+        assert_eq!(explanation["edges"].as_array().unwrap().len(), 2);
         assert_eq!(explanation["findings"].as_array().unwrap().len(), 2);
         assert_eq!(explanation["revisions"].as_array().unwrap().len(), 1);
 
@@ -1701,14 +1702,13 @@ mod tests {
         assert!(
             call_tool(
                 &service,
-                "adjudicate_finding",
+                "commit_invalidation",
                 &json!({
                     "effort":"batch",
-                    "finding":finding,
-                    "outcome":"resolved",
-                    "rationale":"Done",
+                    "node":first,
+                    "target":"current",
+                    "reason":"Reaffirmed",
                     "actor_id":"test",
-                    "session_id":"session",
                     "expected_version":3
                 }),
             )
@@ -1719,6 +1719,40 @@ mod tests {
         assert_eq!(unchanged.version, 3);
         assert_eq!(graph.findings[0].status, FindingStatus::Accepted);
 
+        let reopened = call_tool(
+            &service,
+            "reopen_node",
+            &json!({"effort":"batch","node":first,"actor_id":"test","reason":"Review","expected_version":3}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reopened["effort_version"], 4);
+        let reopened = call_tool(
+            &service,
+            "reopen_node",
+            &json!({"effort":"batch","node":second,"actor_id":"test","reason":"Review","expected_version":4}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reopened["effort_version"], 5);
+        assert!(
+            call_tool(
+                &service,
+                "adjudicate_finding",
+                &json!({
+                    "effort":"batch",
+                    "finding":finding,
+                    "outcome":"resolved",
+                    "rationale":"Done",
+                    "actor_id":"test",
+                    "session_id":"session",
+                    "expected_version":5
+                }),
+            )
+            .await
+            .is_err()
+        );
+
         let reconciled = call_tool(
             &service,
             "apply_batch",
@@ -1726,7 +1760,7 @@ mod tests {
                 "effort":"batch",
                 "actor_id":"test",
                 "session_id":"session",
-                "expected_effort_version":3,
+                "expected_effort_version":5,
                 "operations":[
                     {"op":"resolve_node","node":first,"body":"Clarified first scope","reason":"Reconciled"},
                     {"op":"resolve_node","node":second,"body":"Clarified second scope","reason":"Reconciled"},
@@ -1736,7 +1770,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(reconciled["effort_version"], 4);
+        assert_eq!(reconciled["effort_version"], 6);
 
         call_tool(
             &service,
@@ -1752,7 +1786,7 @@ mod tests {
                 "effort":"batch",
                 "actor_id":"test",
                 "session_id":"session",
-                "expected_effort_version":4,
+                "expected_effort_version":6,
                 "operations":[
                     {"op":"resolve_node","node":question,"body":"Resolved","reason":"Answered"}
                 ]
@@ -1760,7 +1794,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(resolved["effort_version"], 5);
+        assert_eq!(resolved["effort_version"], 7);
         assert!(
             resolved["frontier_after"]
                 .as_array()
@@ -1780,7 +1814,7 @@ mod tests {
                 "effort":"batch",
                 "actor_id":"test",
                 "session_id":"session",
-                "expected_effort_version":5,
+                "expected_effort_version":7,
                 "operations":[
                     {"op":"add_node","temp_id":"e3","value":{"kind":"evidence","title":"Third","summary":"","body":"third","payload":{},"lifecycle":"resolved"}},
                     {"op":"add_edge","source":"e1","type":"informs","target":"e2"},
@@ -1791,7 +1825,7 @@ mod tests {
         .await;
         assert!(failed.is_err());
         let (effort, graph) = service.snapshot("batch").await.unwrap();
-        assert_eq!(effort.version, 5);
+        assert_eq!(effort.version, 7);
         assert_eq!(graph.nodes.len(), 3);
         assert_eq!(graph.edges.len(), 2);
     }

@@ -2019,9 +2019,15 @@ fn prepare_adjudication(
     }
     if before.finding_type == FindingType::Contradiction && outcome == FindingStatus::Resolved {
         for node_id in &before.related_nodes {
-            if select_node(&graph.nodes, node_id)?.validity == Validity::Challenged {
+            let node = select_node(&graph.nodes, node_id)?;
+            let reconciled = match node.validity {
+                Validity::Current => node.lifecycle == Lifecycle::Resolved,
+                Validity::Invalid | Validity::Superseded | Validity::Stale => true,
+                _ => false,
+            };
+            if !reconciled {
                 return Err(DomainError::InvalidState(
-                    "reconcile challenged endpoints before resolving the contradiction".into(),
+                    "reconcile contradiction endpoints before resolving the finding".into(),
                 )
                 .into());
             }
@@ -2040,44 +2046,45 @@ fn prepare_adjudication(
         let left = select_node(&graph.nodes, &before.related_nodes[0])?.clone();
         let right = select_node(&graph.nodes, &before.related_nodes[1])?.clone();
         validate_edge(&left, threadmark_domain::EdgeType::Contradicts, &right)?;
-        if graph.edges.iter().any(|edge| {
-            edge.edge_type == threadmark_domain::EdgeType::Contradicts
-                && ((edge.source_node_id == left.id && edge.target_node_id == right.id)
-                    || (edge.source_node_id == right.id && edge.target_node_id == left.id))
-        }) {
-            return Err(DomainError::InvalidState(
-                "contradiction edge already exists for finding".into(),
-            )
-            .into());
+        edge_id = graph
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.edge_type == threadmark_domain::EdgeType::Contradicts
+                    && ((edge.source_node_id == left.id && edge.target_node_id == right.id)
+                        || (edge.source_node_id == right.id && edge.target_node_id == left.id))
+            })
+            .map(|edge| edge.id.clone());
+        if edge_id.is_none() {
+            let edge = Edge {
+                id: id(),
+                effort_id: effort_id.into(),
+                source_node_id: left.id.clone(),
+                edge_type: threadmark_domain::EdgeType::Contradicts,
+                target_node_id: right.id.clone(),
+                rationale: Some(rationale.clone()),
+                created_by: actor_id.into(),
+                created_at: timestamp.into(),
+            };
+            edge_id = Some(edge.id.clone());
+            graph.edges.push(edge.clone());
+            let audit = event(
+                Some(effort_id),
+                actor_id,
+                Some(session_id),
+                "edge_created",
+                "edge",
+                &edge.id,
+                None,
+                Some(serde_json::to_value(&edge)?),
+                Some(rationale.clone()),
+                timestamp,
+            );
+            mutations.push(BatchMutation::InsertEdge {
+                edge,
+                event: Some(audit),
+            });
         }
-        let edge = Edge {
-            id: id(),
-            effort_id: effort_id.into(),
-            source_node_id: left.id.clone(),
-            edge_type: threadmark_domain::EdgeType::Contradicts,
-            target_node_id: right.id.clone(),
-            rationale: Some(rationale.clone()),
-            created_by: actor_id.into(),
-            created_at: timestamp.into(),
-        };
-        edge_id = Some(edge.id.clone());
-        graph.edges.push(edge.clone());
-        let audit = event(
-            Some(effort_id),
-            actor_id,
-            Some(session_id),
-            "edge_created",
-            "edge",
-            &edge.id,
-            None,
-            Some(serde_json::to_value(&edge)?),
-            Some(rationale.clone()),
-            timestamp,
-        );
-        mutations.push(BatchMutation::InsertEdge {
-            edge,
-            event: Some(audit),
-        });
 
         for node_id in [&left.id, &right.id] {
             let node = graph

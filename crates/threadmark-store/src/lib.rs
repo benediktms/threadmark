@@ -25,6 +25,8 @@ pub struct Pagination {
 pub struct EventCursor {
     pub occurred_at: String,
     pub id: String,
+    #[serde(default)]
+    pub rowid: i64,
     pub through_rowid: i64,
     pub filter: EventFilter,
 }
@@ -529,15 +531,7 @@ impl Store {
         event.after = Some(serde_json::to_value(&*node).expect("node is serializable"));
         check_version(&mut tx, &node.effort_id, expected_version).await?;
         if node.validity == threadmark_domain::Validity::Current {
-            let findings = sqlx::query("SELECT id,related_nodes_json FROM findings WHERE effort_id=? AND type='contradiction' AND status='accepted'")
-                .bind(&node.effort_id).fetch_all(&mut *tx).await?;
-            for finding in findings {
-                let related: Vec<String> =
-                    parse_json("finding.related_nodes", finding.get("related_nodes_json"))?;
-                if related.contains(&node.id) {
-                    return Err(StoreError::AcceptedContradiction(finding.get("id")));
-                }
-            }
+            reject_current_accepted_contradiction(&mut tx, &node.effort_id, &node.id).await?;
         }
         if let ClaimGuard::MustOwn(claimant) | ClaimGuard::OwnIfClaimed(claimant) = claim_guard {
             let owner: Option<String> = sqlx::query_scalar(
@@ -733,6 +727,9 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         check_version(&mut tx, effort_id, expected_version).await?;
         for (node, revision) in updates {
+            if node.validity == threadmark_domain::Validity::Current {
+                reject_current_accepted_contradiction(&mut tx, effort_id, &node.id).await?;
+            }
             sqlx::query("UPDATE nodes SET lifecycle=CASE WHEN ? THEN 'open' ELSE lifecycle END,validity=?,current_revision=?,updated_at=? WHERE id=? AND effort_id=?")
                 .bind(reopened_questions.contains(&node.id))
                 .bind(node.validity.as_str())
@@ -1151,8 +1148,8 @@ impl Store {
                 .or_insert_with(Vec::new)
                 .push(source_id);
         }
-        let mut events = if include_events {
-            sqlx::query("SELECT * FROM events WHERE effort_id=?")
+        let events = if include_events {
+            sqlx::query("SELECT * FROM events WHERE effort_id=? ORDER BY occurred_at,rowid")
                 .bind(effort_id)
                 .fetch_all(&mut *tx)
                 .await?
@@ -1162,9 +1159,6 @@ impl Store {
         } else {
             vec![]
         };
-        if include_events {
-            sort_events(&mut events)?;
-        }
         let sources = sqlx::query("SELECT * FROM sources WHERE effort_id=? ORDER BY created_at")
             .bind(effort_id)
             .fetch_all(&mut *tx)
@@ -1355,7 +1349,7 @@ impl Store {
             return Err(StoreError::CursorFilterMismatch);
         }
         let mut query = QueryBuilder::<Sqlite>::new(
-            "SELECT events.* FROM events JOIN efforts ON efforts.id=events.effort_id \
+            "SELECT events.rowid AS event_rowid,events.* FROM events JOIN efforts ON efforts.id=events.effort_id \
              WHERE efforts.workspace_id=",
         );
         query.push_bind(workspace_id);
@@ -1394,17 +1388,33 @@ impl Store {
         if let Some(value) = &occurred_to_candidate {
             query.push(" AND events.occurred_at<").push_bind(value);
         }
+        let legacy_cursor = page
+            .as_ref()
+            .and_then(|page| page.cursor.as_ref())
+            .is_some_and(|cursor| cursor.rowid == 0);
         if let Some(cursor) = page.as_ref().and_then(|page| page.cursor.as_ref()) {
             query
                 .push(" AND (events.occurred_at>")
                 .push_bind(&cursor.occurred_at)
                 .push(" OR (events.occurred_at=")
-                .push_bind(&cursor.occurred_at)
-                .push(" AND events.id>")
-                .push_bind(&cursor.id)
-                .push("))");
+                .push_bind(&cursor.occurred_at);
+            if legacy_cursor {
+                query
+                    .push(" AND events.id>")
+                    .push_bind(&cursor.id)
+                    .push("))");
+            } else {
+                query
+                    .push(" AND events.rowid>")
+                    .push_bind(cursor.rowid)
+                    .push("))");
+            }
         }
-        query.push(" ORDER BY events.occurred_at,events.id");
+        if legacy_cursor {
+            query.push(" ORDER BY events.occurred_at,events.id");
+        } else {
+            query.push(" ORDER BY events.occurred_at,events.rowid");
+        }
         if let Some(page) = &page {
             query
                 .push(" LIMIT ")
@@ -1418,8 +1428,9 @@ impl Store {
         let mut events = Vec::with_capacity(rows.len());
         let mut last_seen = None;
         for row in rows.into_iter().take(row_limit) {
+            let rowid: i64 = row.get("event_rowid");
             let event = row_to_event(row)?;
-            last_seen = Some((event.occurred_at.clone(), event.id.clone()));
+            last_seen = Some((event.occurred_at.clone(), event.id.clone(), rowid));
             let occurred_at = parse_timestamp(&event.occurred_at)?;
             if occurred_from.is_some_and(|bound| occurred_at < bound)
                 || occurred_to.is_some_and(|bound| occurred_at > bound)
@@ -1428,13 +1439,13 @@ impl Store {
             }
             events.push((occurred_at, event));
         }
-        let mut events = events.into_iter().map(|(_, event)| event).collect();
-        sort_events(&mut events)?;
+        let events = events.into_iter().map(|(_, event)| event).collect();
         let next_cursor = has_more.then(|| {
-            let (occurred_at, id) = last_seen.expect("a full page has a last event");
+            let (occurred_at, id, rowid) = last_seen.expect("a full page has a last event");
             EventCursor {
                 occurred_at,
                 id,
+                rowid,
                 through_rowid,
                 filter: filter.clone(),
             }
@@ -1533,6 +1544,23 @@ async fn check_version(
     let status: String = row.get("status");
     if status != "active" {
         return Err(StoreError::EffortInactive);
+    }
+    Ok(())
+}
+
+async fn reject_current_accepted_contradiction(
+    tx: &mut Transaction<'_, Sqlite>,
+    effort_id: &str,
+    node_id: &str,
+) -> Result<(), StoreError> {
+    let findings = sqlx::query("SELECT id,related_nodes_json FROM findings WHERE effort_id=? AND type='contradiction' AND status='accepted'")
+        .bind(effort_id).fetch_all(&mut **tx).await?;
+    for finding in findings {
+        let related: Vec<String> =
+            parse_json("finding.related_nodes", finding.get("related_nodes_json"))?;
+        if related.iter().any(|related| related == node_id) {
+            return Err(StoreError::AcceptedContradiction(finding.get("id")));
+        }
     }
     Ok(())
 }
@@ -1823,20 +1851,6 @@ fn time_candidate(value: OffsetDateTime, seconds: i64) -> Option<String> {
     )
 }
 
-fn sort_events(events: &mut Vec<AuditEvent>) -> Result<(), StoreError> {
-    let mut parsed = events
-        .drain(..)
-        .map(|event| Ok((parse_timestamp(&event.occurred_at)?, event)))
-        .collect::<Result<Vec<_>, StoreError>>()?;
-    parsed.sort_by(|(left_time, left), (right_time, right)| {
-        left_time
-            .cmp(right_time)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    events.extend(parsed.into_iter().map(|(_, event)| event));
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -2038,6 +2052,8 @@ mod tests {
             .execute(&store.pool).await.unwrap();
         sqlx::query("INSERT INTO events(id,effort_id,actor_id,event_type,entity_type,entity_id,occurred_at) VALUES('early','effort','test','ordered','node','node','2026-01-01T00:30:00.123Z'),('late','effort','test','ordered','node','node','2026-01-01T00:30:00.123456Z')")
             .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO events(id,effort_id,actor_id,event_type,entity_type,entity_id,occurred_at) VALUES('z-first','effort','test','batch_order','node','node','2026-01-01T00:30:01Z'),('a-second','effort','test','batch_order','node','node','2026-01-01T00:30:01Z')")
+            .execute(&store.pool).await.unwrap();
         sqlx::query("DELETE FROM store_metadata WHERE key='event_timestamps_normalized'")
             .execute(&store.pool)
             .await
@@ -2117,6 +2133,42 @@ mod tests {
 
         assert_eq!(first[0].id, "early");
         assert_eq!(second[0].id, "late");
+        let batch_order = EventFilter {
+            event_type: Some("batch_order".into()),
+            ..EventFilter::default()
+        };
+        let events = store.list_events("workspace", &batch_order).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            ["z-first", "a-second"]
+        );
+        let (first, next) = store
+            .list_events_page(
+                "workspace",
+                &batch_order,
+                EventPage {
+                    limit: 1,
+                    cursor: None,
+                },
+            )
+            .await
+            .unwrap();
+        let (second, _) = store
+            .list_events_page(
+                "workspace",
+                &batch_order,
+                EventPage {
+                    limit: 1,
+                    cursor: next,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first[0].id, "z-first");
+        assert_eq!(second[0].id, "a-second");
     }
 
     #[tokio::test]
