@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
-    let service = Service::open(&args.workspace).await?;
+    let service = Service::open_or_init(&args.workspace).await?;
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
     let mut stdout = tokio::io::stdout();
@@ -911,6 +911,27 @@ mod tests {
             Service::open(&args.workspace).await.unwrap().root(),
             project.canonicalize().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn missing_workspace_is_initialized_at_the_git_root() {
+        let repository = TempDir::new().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(repository.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let child = repository.path().join("nested");
+        std::fs::create_dir(&child).unwrap();
+
+        let first = Service::open_or_init(&child).await.unwrap();
+        let second = Service::open_or_init(&child).await.unwrap();
+
+        assert_eq!(first.root(), repository.path().canonicalize().unwrap());
+        assert_eq!(second.workspace().id, first.workspace().id);
     }
 
     #[test]

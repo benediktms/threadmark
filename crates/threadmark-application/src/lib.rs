@@ -151,6 +151,21 @@ impl Service {
         })
     }
 
+    pub async fn open_or_init(start: &Path) -> Result<Self, ApplicationError> {
+        match Self::open(start).await {
+            Ok(service) => Ok(service),
+            Err(ApplicationError::NotInitialized(_)) => {
+                let root = project_root(start);
+                let name = root
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("workspace");
+                Self::init(&root, name).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn open(start: &Path) -> Result<Self, ApplicationError> {
         let root = discover_root(start)?;
         let marker: WorkspaceMarker = toml::from_str(&fs::read_to_string(root.join(MARKER))?)
@@ -1361,6 +1376,18 @@ fn discover_root(start: &Path) -> Result<PathBuf, ApplicationError> {
             ));
         }
     }
+}
+
+#[must_use]
+pub fn project_root(start: &Path) -> PathBuf {
+    Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(start)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+        .unwrap_or_else(|| start.to_path_buf())
 }
 
 fn database_path(root: &Path) -> PathBuf {
