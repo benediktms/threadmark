@@ -1370,8 +1370,26 @@ fn normalize_timestamp(value: &str) -> Result<String, StoreError> {
 }
 
 async fn normalize_event_timestamps(pool: &SqlitePool) -> Result<(), StoreError> {
+    let completed: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM store_metadata WHERE key='event_timestamps_normalized')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if completed {
+        return Ok(());
+    }
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let completed: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM store_metadata WHERE key='event_timestamps_normalized')",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if completed {
+        tx.commit().await?;
+        return Ok(());
+    }
     let rows = sqlx::query("SELECT id,occurred_at FROM events")
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?;
     for row in rows {
         let id: String = row.get("id");
@@ -1381,10 +1399,14 @@ async fn normalize_event_timestamps(pool: &SqlitePool) -> Result<(), StoreError>
             sqlx::query("UPDATE events SET occurred_at=? WHERE id=?")
                 .bind(normalized)
                 .bind(id)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
         }
     }
+    sqlx::query("INSERT INTO store_metadata(key,value) VALUES('event_timestamps_normalized','1')")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1563,6 +1585,10 @@ mod tests {
             .execute(&store.pool).await.unwrap();
         sqlx::query("INSERT INTO events(id,effort_id,actor_id,event_type,entity_type,entity_id,occurred_at) VALUES('early','effort','test','ordered','node','node','2026-01-01T00:30:00.123Z'),('late','effort','test','ordered','node','node','2026-01-01T00:30:00.123456Z')")
             .execute(&store.pool).await.unwrap();
+        sqlx::query("DELETE FROM store_metadata WHERE key='event_timestamps_normalized'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
         drop(store);
         let store = Store::connect(&path).await.unwrap();
 
