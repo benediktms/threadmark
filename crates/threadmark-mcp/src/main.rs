@@ -1882,8 +1882,8 @@ mod tests {
                 "expected_effort_version":7,
                 "operations":[
                     {"op":"add_node","temp_id":"e3","value":{"kind":"evidence","title":"Third","summary":"","body":"third","payload":{},"lifecycle":"resolved"}},
-                    {"op":"add_edge","source":"e1","type":"informs","target":"e2"},
-                    {"op":"add_edge","source":"e1","type":"informs","target":"e2"}
+                    {"op":"add_edge","source":"e1","type":"contradicts","target":"q1"},
+                    {"op":"add_edge","source":"q1","type":"contradicts","target":"e1"}
                 ]
             }),
         )
