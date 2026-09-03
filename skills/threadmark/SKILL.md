@@ -121,9 +121,10 @@ work itself, complete the effort through `threadmark_complete_effort` and stop.
 Turn the converged effort into a proposed implementation-ticket split. This is a
 handoff to the configured tracker, not a new Threadmark graph or an execution DAG.
 
-1. Load every `threadmark_render_handoff` section through its continuation cursor,
-   then use the snapshot and history tools for any provenance or revision detail
-   needed for implementation. Never assume one response is complete.
+1. Load the `overview` handoff section first, pass its snapshot token to every
+   other `threadmark_render_handoff` section, and follow each continuation cursor.
+   Then use snapshot and history for any provenance or revision detail needed for
+   implementation. Never assume one response is complete.
 2. Search the tracker for existing work before proposing new tickets. Reuse or
    relate matching work instead of duplicating it.
 3. Split by independently implementable, reviewable outcomes in delivery order.

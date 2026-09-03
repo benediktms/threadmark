@@ -22,11 +22,17 @@ struct Args {
     workspace: PathBuf,
 }
 
-#[derive(Deserialize, Serialize)]
-struct SnapshotCursor {
+#[derive(Clone, Deserialize, Serialize)]
+struct SnapshotBoundary {
     version: i64,
     event_rowid: i64,
     claims_version: i64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SnapshotCursor {
+    #[serde(flatten)]
+    boundary: SnapshotBoundary,
     section: String,
     offset: u32,
 }
@@ -149,9 +155,11 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
         }
         "threadmark_get_snapshot" => {
             let section = required(args, "section")?;
-            let (effort, items, next_cursor) =
+            let (effort, items, next_cursor, boundary) =
                 snapshot_section_page(service, args, section).await?;
-            Ok(json!({"effort":effort,"section":section,"items":items,"next_cursor":next_cursor}))
+            Ok(
+                json!({"effort":effort,"section":section,"items":items,"snapshot":serde_json::to_string(&boundary)?,"next_cursor":next_cursor}),
+            )
         }
         "threadmark_get_history" => {
             let effort = required(args, "effort")?;
@@ -465,9 +473,33 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
 async fn render_handoff_page(service: &Service, args: &Value) -> Result<Value> {
     let section = required(args, "section")?;
     let effort_selector = required(args, "effort")?;
-    let (effort, items, next_cursor) = if section == "overview" {
-        (service.get_effort(effort_selector).await?, vec![], None)
+    let (effort, items, next_cursor, boundary) = if section == "overview" {
+        anyhow::ensure!(
+            args.get("cursor").is_none(),
+            "overview does not accept a cursor"
+        );
+        let (effort, _, _, event_rowid, claims_version) = service
+            .snapshot_section(
+                effort_selector,
+                "nodes",
+                Pagination {
+                    limit: 0,
+                    offset: 0,
+                },
+            )
+            .await?;
+        let boundary = SnapshotBoundary {
+            version: effort.version,
+            event_rowid,
+            claims_version,
+        };
+        (effort, vec![], None, boundary)
     } else {
+        anyhow::ensure!(
+            args.get("snapshot").and_then(Value::as_str).is_some()
+                || args.get("cursor").and_then(Value::as_str).is_some(),
+            "handoff snapshot is required; load overview first"
+        );
         snapshot_section_page(service, args, section).await?
     };
     let mut graph = GraphSnapshot::default();
@@ -487,8 +519,9 @@ async fn render_handoff_page(service: &Service, args: &Value) -> Result<Value> {
         events: vec![],
     };
     Ok(json!({
-        "handoff": render_handoff_section(&package, section).expect("validated handoff section"),
+        "handoff": render_handoff_section(&package, section, false).expect("validated handoff section"),
         "section": section,
+        "snapshot": serde_json::to_string(&boundary)?,
         "next_cursor": next_cursor,
     }))
 }
@@ -497,7 +530,12 @@ async fn snapshot_section_page(
     service: &Service,
     args: &Value,
     section: &str,
-) -> Result<(threadmark_domain::Effort, Vec<Value>, Option<String>)> {
+) -> Result<(
+    threadmark_domain::Effort,
+    Vec<Value>,
+    Option<String>,
+    SnapshotBoundary,
+)> {
     let (page, expected_snapshot) = snapshot_page(args, section)?;
     let (effort, items, next_offset, event_rowid, claims_version) = service
         .snapshot_section(required(args, "effort")?, section, page)
@@ -510,18 +548,21 @@ async fn snapshot_section_page(
             "snapshot changed between pages"
         );
     }
+    let boundary = SnapshotBoundary {
+        version: effort.version,
+        event_rowid,
+        claims_version,
+    };
     let next_cursor = next_offset
         .map(|offset| {
             serde_json::to_string(&SnapshotCursor {
-                version: effort.version,
-                event_rowid,
-                claims_version,
+                boundary: boundary.clone(),
                 section: section.into(),
                 offset,
             })
         })
         .transpose()?;
-    Ok((effort, items, next_cursor))
+    Ok((effort, items, next_cursor, boundary))
 }
 
 fn tool_definitions() -> Vec<Value> {
@@ -736,10 +777,10 @@ fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "threadmark_render_handoff",
-            "Render one bounded section of the deterministic implementation handoff",
+            "Render one bounded handoff section; load overview first and pass its snapshot token to every other section",
             object(
                 &["effort", "section"],
-                json!({"effort":{"type":"string"},"section":{"type":"string","enum":["overview","nodes","findings","fog_patches","edges"]},"limit":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":"string"}}),
+                json!({"effort":{"type":"string"},"section":{"type":"string","enum":["overview","nodes","findings","fog_patches","edges"]},"snapshot":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":"string"}}),
             ),
         ),
     ]
@@ -845,7 +886,7 @@ fn event_page(args: &Value) -> Result<EventPage> {
     })
 }
 
-fn snapshot_page(args: &Value, section: &str) -> Result<(Pagination, Option<SnapshotCursor>)> {
+fn snapshot_page(args: &Value, section: &str) -> Result<(Pagination, Option<SnapshotBoundary>)> {
     let cursor = args
         .get("cursor")
         .and_then(Value::as_str)
@@ -859,15 +900,21 @@ fn snapshot_page(args: &Value, section: &str) -> Result<(Pagination, Option<Snap
                 limit: page_limit(args)?,
                 offset: cursor.offset,
             },
-            Some(cursor),
+            Some(cursor.boundary),
         ))
     } else {
+        let boundary = args
+            .get("snapshot")
+            .and_then(Value::as_str)
+            .map(serde_json::from_str::<SnapshotBoundary>)
+            .transpose()
+            .context("invalid snapshot boundary")?;
         Ok((
             Pagination {
                 limit: page_limit(args)?,
                 offset: 0,
             },
-            None,
+            boundary,
         ))
     }
 }
@@ -962,8 +1009,10 @@ mod tests {
         let child = repository.path().join("nested");
         std::fs::create_dir(&child).unwrap();
 
-        let first = Service::open_or_init(&child).await.unwrap();
-        let second = Service::open_or_init(&child).await.unwrap();
+        let (first, second) =
+            tokio::join!(Service::open_or_init(&child), Service::open_or_init(&child));
+        let first = first.unwrap();
+        let second = second.unwrap();
 
         assert_eq!(first.root(), repository.path().canonicalize().unwrap());
         assert_eq!(second.workspace().id, first.workspace().id);
@@ -1221,10 +1270,17 @@ mod tests {
         )
         .await
         .unwrap();
+        let handoff_overview = call_tool(
+            &service,
+            "threadmark_render_handoff",
+            &json!({"effort": "parity", "section": "overview"}),
+        )
+        .await
+        .unwrap();
         let handoff = call_tool(
             &service,
             "threadmark_render_handoff",
-            &json!({"effort": "parity", "section": "nodes", "limit": 1}),
+            &json!({"effort": "parity", "section": "nodes", "limit": 1, "snapshot": handoff_overview["snapshot"]}),
         )
         .await
         .unwrap();
@@ -1271,6 +1327,12 @@ mod tests {
             &json!({"effort": "parity", "section": "claims", "limit": 1, "cursor": claims["next_cursor"]}),
         )
         .await;
+        let stale_handoff_section = call_tool(
+            &service,
+            "threadmark_render_handoff",
+            &json!({"effort": "parity", "section": "findings", "snapshot": handoff_overview["snapshot"]}),
+        )
+        .await;
 
         assert_eq!(effort["status"], "active");
         assert_eq!(snapshot_nodes["items"].as_array().unwrap().len(), 1);
@@ -1296,9 +1358,16 @@ mod tests {
         assert_eq!(node_history["revisions"].as_array().unwrap().len(), 1);
         assert!(handoff["handoff"].as_str().unwrap().contains("First"));
         assert!(!handoff["handoff"].as_str().unwrap().contains("Second"));
+        assert!(
+            !handoff["handoff"]
+                .as_str()
+                .unwrap()
+                .contains("None recorded")
+        );
         assert!(handoff["next_cursor"].is_string());
         assert!(handoff_next["handoff"].as_str().unwrap().contains("Second"));
         assert!(stale_claims.is_err());
+        assert!(stale_handoff_section.is_err());
         for name in [
             "threadmark_create_effort",
             "threadmark_get_snapshot",

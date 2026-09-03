@@ -156,6 +156,24 @@ impl Service {
             Ok(service) => Ok(service),
             Err(ApplicationError::NotInitialized(_)) => {
                 let root = project_root(start);
+                fs::create_dir_all(root.join(".threadmark"))?;
+                let lock = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(root.join(".threadmark/init.lock"))?;
+                let _lock = tokio::task::spawn_blocking(move || {
+                    lock.lock()?;
+                    Ok::<_, std::io::Error>(lock)
+                })
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))??;
+                match Self::open(start).await {
+                    Ok(service) => return Ok(service),
+                    Err(ApplicationError::NotInitialized(_)) => {}
+                    Err(error) => return Err(error),
+                }
                 let name = root
                     .file_name()
                     .and_then(|name| name.to_str())
