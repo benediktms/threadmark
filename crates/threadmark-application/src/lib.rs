@@ -1857,13 +1857,19 @@ impl Service {
 
         let (effort_version, before_nodes, before_claims, nodes, claims) = self
             .store
-            .apply_batch(
-                &effort.id,
-                input.expected_effort_version,
-                &mutations,
-                &timestamp,
-            )
+            .apply_batch(&effort.id, input.expected_effort_version, &mut mutations)
             .await?;
+        for mutation in &mutations {
+            if let BatchMutation::UpdateFinding { finding, .. }
+            | BatchMutation::InsertFinding { finding, .. } = mutation
+            {
+                *graph
+                    .findings
+                    .iter_mut()
+                    .find(|current| current.id == finding.id)
+                    .expect("prepared batch finding exists") = finding.clone();
+            }
+        }
         before.nodes = before_nodes;
         before.claims = before_claims;
         graph.nodes = nodes;

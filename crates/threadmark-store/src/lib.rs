@@ -833,10 +833,12 @@ impl Store {
         &self,
         effort_id: &str,
         expected_version: i64,
-        mutations: &[BatchMutation],
-        now: &str,
+        mutations: &mut [BatchMutation],
     ) -> Result<(i64, Vec<Node>, Vec<Claim>, Vec<Node>, Vec<Claim>), StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .expect("RFC 3339 formatting succeeds");
         let cutoff = reap_expired_claims(&mut tx, effort_id).await?;
         check_version(&mut tx, effort_id, expected_version).await?;
         let before_nodes = sqlx::query("SELECT n.*,r.body,r.payload_json FROM nodes n JOIN node_revisions r ON r.node_id=n.id AND r.revision=n.current_revision WHERE n.effort_id=? ORDER BY n.created_at")
@@ -844,6 +846,7 @@ impl Store {
         let before_claims = sqlx::query("SELECT c.* FROM claims c JOIN nodes n ON n.id=c.node_id WHERE n.effort_id=? ORDER BY c.claimed_at")
             .bind(effort_id).fetch_all(&mut *tx).await?.into_iter().map(row_to_claim).collect();
         for mutation in mutations {
+            retimestamp_batch_mutation(mutation, &now);
             let event = match mutation {
                 BatchMutation::InsertNode {
                     node,
@@ -938,9 +941,9 @@ impl Store {
                     sqlx::query(
                         "INSERT INTO node_sources(node_id,source_id,relationship) VALUES(?,?,?)",
                     )
-                    .bind(node_id)
-                    .bind(source_id)
-                    .bind(relationship)
+                    .bind(node_id.as_str())
+                    .bind(source_id.as_str())
+                    .bind(relationship.as_str())
                     .execute(&mut *tx)
                     .await?;
                     event.clone()
@@ -951,10 +954,10 @@ impl Store {
                     event,
                 } => {
                     sqlx::query("UPDATE fog_patches SET status='graduated',updated_at=? WHERE id=? AND effort_id=? AND status='active'")
-                        .bind(now).bind(fog_id).bind(effort_id).execute(&mut *tx).await?;
-                    for node_id in node_ids {
+                        .bind(&now).bind(fog_id.as_str()).bind(effort_id).execute(&mut *tx).await?;
+                    for node_id in node_ids.iter() {
                         sqlx::query("INSERT INTO fog_graduations(fog_id,node_id) VALUES(?,?)")
-                            .bind(fog_id)
+                            .bind(fog_id.as_str())
                             .bind(node_id)
                             .execute(&mut *tx)
                             .await?;
@@ -981,7 +984,7 @@ impl Store {
                 insert_event(&mut tx, &event).await?;
             }
         }
-        let version = bump_version(&mut tx, effort_id, now).await?;
+        let version = bump_version(&mut tx, effort_id, &now).await?;
         let nodes = sqlx::query("SELECT n.*,r.body,r.payload_json FROM nodes n JOIN node_revisions r ON r.node_id=n.id AND r.revision=n.current_revision WHERE n.effort_id=? ORDER BY n.created_at")
             .bind(effort_id).fetch_all(&mut *tx).await?.into_iter().map(row_to_node).collect::<Result<_,_>>()?;
         let claims = sqlx::query("SELECT c.* FROM claims c JOIN nodes n ON n.id=c.node_id WHERE n.effort_id=? ORDER BY c.claimed_at")
@@ -1460,7 +1463,7 @@ impl Store {
             EventCursor {
                 occurred_at,
                 id,
-                rowid,
+                rowid: if legacy_cursor { 0 } else { rowid },
                 through_rowid,
                 filter: filter.clone(),
             }
@@ -1474,6 +1477,62 @@ impl Store {
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(row_to_source).collect()
+    }
+}
+
+fn retimestamp_batch_mutation(mutation: &mut BatchMutation, now: &str) {
+    let event = match mutation {
+        BatchMutation::InsertNode {
+            node,
+            revision,
+            event,
+        } => {
+            node.created_at = now.into();
+            node.updated_at = now.into();
+            revision.created_at = now.into();
+            event
+        }
+        BatchMutation::UpdateNode {
+            node,
+            revision,
+            event,
+            ..
+        }
+        | BatchMutation::ChallengeNode {
+            node,
+            revision,
+            event,
+        } => {
+            node.updated_at = now.into();
+            revision.created_at = now.into();
+            event
+        }
+        BatchMutation::InsertEdge { edge, event } => {
+            edge.created_at = now.into();
+            event
+        }
+        BatchMutation::InsertSource { source, event } => {
+            source.created_at = now.into();
+            if source.retrieved_at.is_some() {
+                source.retrieved_at = Some(now.into());
+            }
+            event
+        }
+        BatchMutation::UpdateFinding { finding, event } => {
+            finding.updated_at = now.into();
+            event
+        }
+        BatchMutation::InsertFinding { finding, event } => {
+            finding.created_at = now.into();
+            finding.updated_at = now.into();
+            event
+        }
+        BatchMutation::AttachSource { event, .. } | BatchMutation::GraduateFog { event, .. } => {
+            event
+        }
+    };
+    if let Some(event) = event {
+        event.occurred_at = now.into();
     }
 }
 
@@ -1997,17 +2056,13 @@ mod tests {
             created_at: "later".into(),
         };
 
+        let mut mutations = [BatchMutation::ChallengeNode {
+            node: stale,
+            revision,
+            event: None,
+        }];
         let (_, before_nodes, _, nodes, _) = store
-            .apply_batch(
-                "effort",
-                1,
-                &[BatchMutation::ChallengeNode {
-                    node: stale,
-                    revision,
-                    event: None,
-                }],
-                "later",
-            )
+            .apply_batch("effort", 1, &mut mutations)
             .await
             .unwrap();
 
@@ -2019,11 +2074,12 @@ mod tests {
         stale.lifecycle = Lifecycle::Resolved;
         stale.validity = Validity::Current;
         stale.current_revision = 2;
+        stale.updated_at = "1999-01-01T00:00:00Z".into();
         sqlx::query("UPDATE nodes SET lifecycle='in_progress' WHERE id='node'")
             .execute(&store.pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO claims(id,node_id,actor_id,claimant,claimed_at,heartbeat_at,lease_expires_at) VALUES('claim','node','test','test','now','now','2999-01-01T00:00:00Z')")
+        sqlx::query("INSERT INTO claims(id,node_id,actor_id,claimant,claimed_at,heartbeat_at,lease_expires_at) VALUES('claim','node','test','test','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z','2999-01-01T00:00:00Z')")
             .execute(&store.pool).await.unwrap();
         let revision = NodeRevision {
             node_id: stale.id.clone(),
@@ -2033,7 +2089,7 @@ mod tests {
             reason: Some("resolved".into()),
             actor_id: "test".into(),
             session_id: None,
-            created_at: "later".into(),
+            created_at: "1999-01-01T00:00:00Z".into(),
         };
         let event = AuditEvent {
             id: "resolved-event".into(),
@@ -2046,20 +2102,16 @@ mod tests {
             before: None,
             after: None,
             reason: None,
-            occurred_at: "2026-01-01T00:00:00Z".into(),
+            occurred_at: "1999-01-01T00:00:00Z".into(),
         };
+        let mut mutations = [BatchMutation::UpdateNode {
+            node: stale,
+            revision,
+            claimant: Some("test".into()),
+            event: Some(event),
+        }];
         store
-            .apply_batch(
-                "effort",
-                2,
-                &[BatchMutation::UpdateNode {
-                    node: stale,
-                    revision,
-                    claimant: Some("test".into()),
-                    event: Some(event),
-                }],
-                "later",
-            )
+            .apply_batch("effort", 2, &mut mutations)
             .await
             .unwrap();
         let before: String =
@@ -2071,6 +2123,18 @@ mod tests {
             serde_json::from_str::<Value>(&before).unwrap()["lifecycle"],
             "in_progress"
         );
+        let occurred_at: String =
+            sqlx::query_scalar("SELECT occurred_at FROM events WHERE id='resolved-event'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        let released_at: String =
+            sqlx::query_scalar("SELECT released_at FROM claims WHERE id='claim'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert!(occurred_at.as_str() > "2000-01-01T00:00:00Z");
+        assert!(released_at.as_str() > "2000-01-01T00:00:00Z");
     }
 
     #[tokio::test]
@@ -2125,6 +2189,8 @@ mod tests {
         sqlx::query("INSERT INTO events(id,effort_id,actor_id,event_type,entity_type,entity_id,occurred_at) VALUES('early','effort','test','ordered','node','node','2026-01-01T00:30:00.123Z'),('late','effort','test','ordered','node','node','2026-01-01T00:30:00.123456Z')")
             .execute(&store.pool).await.unwrap();
         sqlx::query("INSERT INTO events(id,effort_id,actor_id,event_type,entity_type,entity_id,occurred_at) VALUES('z-first','effort','test','batch_order','node','node','2026-01-01T00:30:01Z'),('a-second','effort','test','batch_order','node','node','2026-01-01T00:30:01Z')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO events(id,effort_id,actor_id,event_type,entity_type,entity_id,occurred_at) VALUES('a-first','effort','test','legacy_order','node','node','2026-01-01T00:30:02Z'),('z-second','effort','test','legacy_order','node','node','2026-01-01T00:30:02Z'),('m-third','effort','test','legacy_order','node','node','2026-01-01T00:30:02Z')")
             .execute(&store.pool).await.unwrap();
         sqlx::query("DELETE FROM store_metadata WHERE key='event_timestamps_normalized'")
             .execute(&store.pool)
@@ -2241,6 +2307,46 @@ mod tests {
             .unwrap();
         assert_eq!(first[0].id, "z-first");
         assert_eq!(second[0].id, "a-second");
+
+        let legacy_filter = EventFilter {
+            event_type: Some("legacy_order".into()),
+            ..EventFilter::default()
+        };
+        let through_rowid: i64 = sqlx::query_scalar("SELECT MAX(rowid) FROM events")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        let (first, next) = store
+            .list_events_page(
+                "workspace",
+                &legacy_filter,
+                EventPage {
+                    limit: 1,
+                    cursor: Some(EventCursor {
+                        occurred_at: "2026-01-01T00:30:01Z".into(),
+                        id: String::new(),
+                        rowid: 0,
+                        through_rowid,
+                        filter: legacy_filter.clone(),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        let (second, next) = store
+            .list_events_page(
+                "workspace",
+                &legacy_filter,
+                EventPage {
+                    limit: 1,
+                    cursor: next,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first[0].id, "a-first");
+        assert_eq!(second[0].id, "m-third");
+        assert_eq!(next.unwrap().rowid, 0);
     }
 
     #[tokio::test]
