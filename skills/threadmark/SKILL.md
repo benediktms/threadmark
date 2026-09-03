@@ -12,8 +12,8 @@ do not fall back to the CLI or edit SQLite directly.
 
 Workspace initialization is an operator/bootstrap concern. When no existing
 effort fits and the user explicitly authorizes a new effort, create it through
-`threadmark_create_effort`; never fall back to the CLI. An effort is complete
-only after readiness passes and `threadmark_complete_effort` succeeds.
+`create_effort`; never fall back to the CLI. An effort is complete
+only after readiness passes and `complete_effort` succeeds.
 
 ## Workflow state machine
 
@@ -101,7 +101,7 @@ CLI as a fallback.
 
 Inspect the challenged premise, decision, or review-required descendant. Read
 [references/graph-semantics.md](references/graph-semantics.md). If the effort is
-completed, reactivate it first with `threadmark_reopen_effort`, recording the
+completed, reactivate it first with `reopen_effort`, recording the
 actor, reason, and expected effort version. Preview invalidation and commit only
 the reviewed propagation. Then return to **Work** for reopened nodes or
 **Verify** when no work remains.
@@ -114,7 +114,7 @@ challenged or review-required conclusion -> **Reconcile**; human decision ->
 **Stop**. When all required checks pass and implementation work remains, ask the
 user whether they want it split into tickets, then stop. Enter **Split** only
 after explicit approval. If they decline, or the destination was the completed
-work itself, complete the effort through `threadmark_complete_effort` and stop.
+work itself, complete the effort through `complete_effort` and stop.
 
 ### Split implementation tickets
 
@@ -122,7 +122,7 @@ Turn the converged effort into a proposed implementation-ticket split. This is a
 handoff to the configured tracker, not a new Threadmark graph or an execution DAG.
 
 1. Load the `overview` handoff section first, pass its snapshot token to every
-   other `threadmark_render_handoff` section, and follow each continuation cursor.
+   other `render_handoff` section, and follow each continuation cursor.
    Then use snapshot and history for any provenance or revision detail needed for
    implementation. Never assume one response is complete.
 2. Search the tracker for existing work before proposing new tickets. Reuse or
@@ -139,7 +139,7 @@ handoff to the configured tracker, not a new Threadmark graph or an execution DA
    or publish tickets only after explicit approval, following the repository's
    tracker instructions.
 6. After the approved handoff is filed, complete the effort through
-   `threadmark_complete_effort`. If the user declines tracker mutation, complete
+   `complete_effort`. If the user declines tracker mutation, complete
    it only when they explicitly accept the proposed split as the handoff.
 
 Stop at the ticket boundary unless execution is explicitly in scope.
