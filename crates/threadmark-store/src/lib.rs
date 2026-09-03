@@ -859,7 +859,7 @@ impl Store {
                         .bind(node.current_revision).bind(&node.created_at).bind(&node.updated_at)
                         .execute(&mut *tx).await?;
                     insert_revision(&mut tx, revision).await?;
-                    event
+                    event.clone()
                 }
                 BatchMutation::UpdateNode {
                     node,
@@ -867,6 +867,10 @@ impl Store {
                     claimant,
                     event,
                 } => {
+                    let before = row_to_node(
+                        sqlx::query("SELECT n.*,r.body,r.payload_json FROM nodes n JOIN node_revisions r ON r.node_id=n.id AND r.revision=n.current_revision WHERE n.id=? AND n.effort_id=?")
+                            .bind(&node.id).bind(effort_id).fetch_one(&mut *tx).await?,
+                    )?;
                     if let Some(claimant) = claimant {
                         let owner: Option<String> = sqlx::query_scalar(
                             "SELECT claimant FROM claims WHERE node_id=? \
@@ -892,6 +896,11 @@ impl Store {
                         sqlx::query("UPDATE claims SET released_at=?,release_reason='node resolved' WHERE node_id=? AND released_at IS NULL")
                             .bind(&node.updated_at).bind(&node.id).execute(&mut *tx).await?;
                     }
+                    let mut event = event.clone();
+                    if let Some(event) = &mut event {
+                        event.before = Some(serde_json::to_value(before).expect("node serializes"));
+                        event.after = Some(serde_json::to_value(node).expect("node serializes"));
+                    }
                     event
                 }
                 BatchMutation::ChallengeNode {
@@ -903,14 +912,14 @@ impl Store {
                         .bind(node.validity.as_str()).bind(node.current_revision).bind(&node.updated_at)
                         .bind(&node.id).bind(effort_id).execute(&mut *tx).await?;
                     insert_revision(&mut tx, revision).await?;
-                    event
+                    event.clone()
                 }
                 BatchMutation::InsertEdge { edge, event } => {
                     sqlx::query("INSERT INTO edges(id,effort_id,source_node_id,type,target_node_id,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)")
                         .bind(&edge.id).bind(&edge.effort_id).bind(&edge.source_node_id).bind(edge.edge_type.as_str())
                         .bind(&edge.target_node_id).bind(&edge.rationale).bind(&edge.created_by).bind(&edge.created_at)
                         .execute(&mut *tx).await?;
-                    event
+                    event.clone()
                 }
                 BatchMutation::InsertSource { source, event } => {
                     sqlx::query("INSERT INTO sources(id,effort_id,kind,uri,title,retrieved_at,observed_at,content_hash,excerpt,metadata_json,trust,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
@@ -918,7 +927,7 @@ impl Store {
                         .bind(&source.retrieved_at).bind(&source.observed_at).bind(&source.content_hash).bind(&source.excerpt)
                         .bind(serde_json::to_string(&source.metadata).expect("JSON value serializes")).bind(source.trust.as_str()).bind(&source.created_at)
                         .execute(&mut *tx).await?;
-                    event
+                    event.clone()
                 }
                 BatchMutation::AttachSource {
                     node_id,
@@ -934,7 +943,7 @@ impl Store {
                     .bind(relationship)
                     .execute(&mut *tx)
                     .await?;
-                    event
+                    event.clone()
                 }
                 BatchMutation::GraduateFog {
                     fog_id,
@@ -950,13 +959,13 @@ impl Store {
                             .execute(&mut *tx)
                             .await?;
                     }
-                    event
+                    event.clone()
                 }
                 BatchMutation::UpdateFinding { finding, event } => {
                     sqlx::query("UPDATE findings SET status=?,adjudication=?,updated_at=? WHERE id=? AND effort_id=?")
                         .bind(finding.status.as_str()).bind(&finding.adjudication).bind(&finding.updated_at)
                         .bind(&finding.id).bind(effort_id).execute(&mut *tx).await?;
-                    event
+                    event.clone()
                 }
                 BatchMutation::InsertFinding { finding, event } => {
                     sqlx::query("INSERT INTO findings(id,effort_id,type,severity,status,title,detail,related_nodes_json,proposed_by,adjudication,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
@@ -965,11 +974,11 @@ impl Store {
                         .bind(serde_json::to_string(&finding.related_nodes).expect("JSON value serializes"))
                         .bind(&finding.proposed_by).bind(&finding.adjudication).bind(&finding.created_at).bind(&finding.updated_at)
                         .execute(&mut *tx).await?;
-                    event
+                    event.clone()
                 }
             };
             if let Some(event) = event {
-                insert_event(&mut tx, event).await?;
+                insert_event(&mut tx, &event).await?;
             }
         }
         let version = bump_version(&mut tx, effort_id, now).await?;
@@ -1159,10 +1168,16 @@ impl Store {
         } else {
             vec![]
         };
-        let sources = sqlx::query("SELECT * FROM sources WHERE effort_id=? ORDER BY created_at")
-            .bind(effort_id)
-            .fetch_all(&mut *tx)
-            .await?
+        let source_rows = if let Some(node_id) = node_id {
+            sqlx::query("SELECT * FROM sources WHERE EXISTS (SELECT 1 FROM node_sources WHERE node_sources.source_id=sources.id AND node_sources.node_id=?) ORDER BY created_at")
+                .bind(node_id).fetch_all(&mut *tx).await?
+        } else {
+            sqlx::query("SELECT * FROM sources WHERE effort_id=? ORDER BY created_at")
+                .bind(effort_id)
+                .fetch_all(&mut *tx)
+                .await?
+        };
+        let sources = source_rows
             .into_iter()
             .map(row_to_source)
             .collect::<Result<Vec<_>, _>>()?;
@@ -1950,7 +1965,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_challenge_does_not_restore_a_released_claim_lifecycle() {
+    async fn batch_uses_transaction_current_node_state() {
         let directory = TempDir::new().unwrap();
         let store = Store::connect(&directory.path().join("state.sqlite3"))
             .await
@@ -1999,6 +2014,63 @@ mod tests {
         assert_eq!(before_nodes[0].lifecycle, Lifecycle::Open);
         assert_eq!(nodes[0].lifecycle, Lifecycle::Open);
         assert_eq!(nodes[0].validity, Validity::Challenged);
+
+        let mut stale = store.get_node("effort", "node").await.unwrap();
+        stale.lifecycle = Lifecycle::Resolved;
+        stale.validity = Validity::Current;
+        stale.current_revision = 2;
+        sqlx::query("UPDATE nodes SET lifecycle='in_progress' WHERE id='node'")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO claims(id,node_id,actor_id,claimant,claimed_at,heartbeat_at,lease_expires_at) VALUES('claim','node','test','test','now','now','2999-01-01T00:00:00Z')")
+            .execute(&store.pool).await.unwrap();
+        let revision = NodeRevision {
+            node_id: stale.id.clone(),
+            revision: stale.current_revision,
+            body: String::new(),
+            payload: json!({}),
+            reason: Some("resolved".into()),
+            actor_id: "test".into(),
+            session_id: None,
+            created_at: "later".into(),
+        };
+        let event = AuditEvent {
+            id: "resolved-event".into(),
+            effort_id: Some("effort".into()),
+            actor_id: "test".into(),
+            session_id: None,
+            event_type: "node_resolved".into(),
+            entity_type: "node".into(),
+            entity_id: "node".into(),
+            before: None,
+            after: None,
+            reason: None,
+            occurred_at: "2026-01-01T00:00:00Z".into(),
+        };
+        store
+            .apply_batch(
+                "effort",
+                2,
+                &[BatchMutation::UpdateNode {
+                    node: stale,
+                    revision,
+                    claimant: Some("test".into()),
+                    event: Some(event),
+                }],
+                "later",
+            )
+            .await
+            .unwrap();
+        let before: String =
+            sqlx::query_scalar("SELECT before_json FROM events WHERE id='resolved-event'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&before).unwrap()["lifecycle"],
+            "in_progress"
+        );
     }
 
     #[tokio::test]
