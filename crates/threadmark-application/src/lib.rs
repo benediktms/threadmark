@@ -581,7 +581,9 @@ impl Service {
         ApplicationError,
     > {
         let effort = self.get_effort(effort).await?;
-        Ok(self.store.snapshot_bundle(&effort.id, true).await?)
+        let (effort, graph, sources, events, _) =
+            self.store.snapshot_bundle(&effort.id, true, false).await?;
+        Ok((effort, graph, sources, events))
     }
 
     pub async fn snapshot_with_sources(
@@ -589,7 +591,8 @@ impl Service {
         effort: &str,
     ) -> Result<(Effort, GraphSnapshot, Vec<threadmark_domain::Source>), ApplicationError> {
         let effort = self.get_effort(effort).await?;
-        let (effort, graph, sources, _) = self.store.snapshot_bundle(&effort.id, false).await?;
+        let (effort, graph, sources, _, _) =
+            self.store.snapshot_bundle(&effort.id, false, false).await?;
         Ok((effort, graph, sources))
     }
 
@@ -649,7 +652,9 @@ impl Service {
         effort: &str,
         selector: &str,
     ) -> Result<NodeExplanation, ApplicationError> {
-        let (effort, graph, sources) = self.snapshot_with_sources(effort).await?;
+        let effort = self.get_effort(effort).await?;
+        let (effort, graph, sources, _, revisions) =
+            self.store.snapshot_bundle(&effort.id, false, true).await?;
         let node = select_node(&graph.nodes, selector)?.clone();
         let edges = graph
             .edges
@@ -676,7 +681,10 @@ impl Service {
             .into_iter()
             .filter(|finding| finding.related_nodes.contains(&node.id))
             .collect();
-        let revisions = self.store.list_revisions(&node.id).await?;
+        let revisions = revisions
+            .into_iter()
+            .filter(|revision| revision.node_id == node.id)
+            .collect();
         debug_assert_eq!(effort.id, node.effort_id);
         Ok(NodeExplanation {
             node,
@@ -1457,9 +1465,8 @@ impl Service {
         input: AdjudicateFinding,
     ) -> Result<(Finding, BatchResult), ApplicationError> {
         let selector = input.finding.clone();
-        let effort = input.effort.clone();
-        let result = self
-            .apply_batch(
+        let (result, graph) = self
+            .apply_batch_inner(
                 ApplyBatch {
                     effort: input.effort,
                     actor_id: input.actor_id,
@@ -1474,7 +1481,6 @@ impl Service {
                 None,
             )
             .await?;
-        let (_, graph) = self.snapshot(&effort).await?;
         Ok((select_finding(&graph.findings, &selector)?.clone(), result))
     }
 
@@ -1483,6 +1489,14 @@ impl Service {
         input: ApplyBatch,
         claimant: Option<&str>,
     ) -> Result<BatchResult, ApplicationError> {
+        Ok(self.apply_batch_inner(input, claimant).await?.0)
+    }
+
+    async fn apply_batch_inner(
+        &self,
+        input: ApplyBatch,
+        claimant: Option<&str>,
+    ) -> Result<(BatchResult, GraphSnapshot), ApplicationError> {
         if input.operations.is_empty() {
             return Err(
                 DomainError::InvalidState("batch requires at least one operation".into()).into(),
@@ -1825,8 +1839,9 @@ impl Service {
                 )?,
             }
         }
+        validate_accepted_contradictions(&graph)?;
 
-        let effort_version = self
+        let (effort_version, nodes, claims) = self
             .store
             .apply_batch(
                 &effort.id,
@@ -1835,15 +1850,20 @@ impl Service {
                 &timestamp,
             )
             .await?;
-        Ok(BatchResult {
-            effort_version,
-            ids,
-            frontier_before: calculate_frontier(&before, &timestamp),
-            frontier_after: calculate_frontier(&graph, &timestamp),
-            findings_created,
-            readiness_before: evaluate_readiness(&before),
-            readiness_after: evaluate_readiness(&graph),
-        })
+        graph.nodes = nodes;
+        graph.claims = claims;
+        Ok((
+            BatchResult {
+                effort_version,
+                ids,
+                frontier_before: calculate_frontier(&before, &timestamp),
+                frontier_after: calculate_frontier(&graph, &timestamp),
+                findings_created,
+                readiness_before: evaluate_readiness(&before),
+                readiness_after: evaluate_readiness(&graph),
+            },
+            graph,
+        ))
     }
 }
 
@@ -1919,6 +1939,24 @@ fn reject_dependency_cycle(graph: &GraphSnapshot) -> Result<(), ApplicationError
         .find(|finding| finding.code == "TM004")
     {
         return Err(ApplicationError::InvalidGraph(issue.message));
+    }
+    Ok(())
+}
+
+fn validate_accepted_contradictions(graph: &GraphSnapshot) -> Result<(), ApplicationError> {
+    for finding in graph.findings.iter().filter(|finding| {
+        finding.finding_type == FindingType::Contradiction
+            && finding.status == FindingStatus::Accepted
+    }) {
+        for node_id in &finding.related_nodes {
+            if select_node(&graph.nodes, node_id)?.validity == Validity::Current {
+                return Err(DomainError::InvalidState(format!(
+                    "accepted contradiction {} still has a current endpoint",
+                    finding.id
+                ))
+                .into());
+            }
+        }
     }
     Ok(())
 }
@@ -2006,16 +2044,29 @@ fn prepare_adjudication(
             if node.validity != Validity::Current {
                 continue;
             }
+            let before_node = serde_json::to_value(&*node)?;
             node.validity = Validity::Challenged;
             node.current_revision += 1;
             node.updated_at = timestamp.into();
             let revision = revision(node, actor_id, Some(session_id), &rationale, timestamp);
             affected_nodes.push(node.id.clone());
+            let audit = event(
+                Some(effort_id),
+                actor_id,
+                Some(session_id),
+                "node_challenged",
+                "node",
+                &node.id,
+                Some(before_node),
+                Some(serde_json::to_value(&*node)?),
+                Some(rationale.clone()),
+                timestamp,
+            );
             mutations.push(BatchMutation::UpdateNode {
                 node: node.clone(),
                 revision,
                 claimant: None,
-                event: None,
+                event: Some(audit),
             });
         }
     }

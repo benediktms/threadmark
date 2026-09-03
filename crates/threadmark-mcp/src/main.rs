@@ -1029,6 +1029,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use threadmark_application::CreateEffort;
+    use threadmark_domain::FindingStatus;
 
     #[tokio::test]
     async fn explicit_workspace_opens_a_nested_initialized_project() {
@@ -1597,6 +1598,30 @@ mod tests {
         assert_eq!(explanation["findings"].as_array().unwrap().len(), 1);
         assert_eq!(explanation["revisions"].as_array().unwrap().len(), 1);
 
+        let conflicting = call_tool(
+            &service,
+            "apply_batch",
+            &json!({
+                "effort":"batch",
+                "actor_id":"test",
+                "session_id":"session",
+                "expected_effort_version":2,
+                "operations":[
+                    {"op":"adjudicate_finding","finding":finding,"outcome":"accepted","rationale":"The scopes overlap"},
+                    {"op":"resolve_node","node":first,"body":"Reaffirmed","reason":"Reviewed"}
+                ]
+            }),
+        )
+        .await;
+        assert!(conflicting.is_err());
+        let (unchanged, graph) = service.snapshot("batch").await.unwrap();
+        assert_eq!(unchanged.version, 2);
+        assert_eq!(graph.findings[0].status, FindingStatus::Proposed);
+        assert_eq!(
+            service.get_node("batch", first).await.unwrap().validity,
+            Validity::Current
+        );
+
         let adjudicated = call_tool(
             &service,
             "adjudicate_finding",
@@ -1623,6 +1648,12 @@ mod tests {
                 .filter(|node| node.kind == NodeKind::Evidence)
                 .all(|node| node.validity == Validity::Challenged)
         );
+        let history = service.effort_history("batch").await.unwrap();
+        assert!(history.iter().any(|event| {
+            event.event_type == "node_challenged"
+                && event.entity_type == "node"
+                && event.entity_id == first
+        }));
 
         call_tool(
             &service,
@@ -1647,6 +1678,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resolved["effort_version"], 4);
+        assert!(
+            resolved["frontier_after"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["node"]["id"] != question)
+        );
         assert_eq!(
             service.get_node("batch", question).await.unwrap().lifecycle,
             Lifecycle::Resolved

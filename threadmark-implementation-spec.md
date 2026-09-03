@@ -1013,18 +1013,17 @@ Agents should normally submit one atomic change set after completing an investig
 
 ```json
 {
-  "effort_id": "...",
+  "effort": "...",
   "expected_effort_version": 17,
   "actor_id": "codex",
   "session_id": "session-...",
-  "claim_id": "...",
   "operations": [
-    {"op": "add_source", "temp_id": "s1", "value": {}},
-    {"op": "add_evidence", "temp_id": "e1", "value": {}},
-    {"op": "attach_source", "node": "e1", "source": "s1"},
-    {"op": "resolve_node", "node": "Q1", "answer": "..."},
+    {"op": "add_source", "temp_id": "s1", "kind": "url", "title": "Benchmark", "uri": "https://example.com"},
+    {"op": "add_node", "temp_id": "e1", "value": {"kind": "evidence", "title": "Benchmark result", "summary": "...", "body": "...", "payload": {}, "lifecycle": "resolved"}},
+    {"op": "attach_source", "node": "e1", "source": "s1", "relationship": "supports"},
+    {"op": "resolve_node", "node": "Q1", "body": "...", "reason": "Investigation complete"},
     {"op": "add_edge", "source": "e1", "type": "resolves", "target": "Q1"},
-    {"op": "add_question", "temp_id": "q2", "value": {}},
+    {"op": "add_node", "temp_id": "q2", "value": {"kind": "question", "title": "Follow-up", "summary": "...", "body": "", "payload": {}, "lifecycle": "open"}},
     {"op": "graduate_fog", "fog": "F3", "to": ["q2"]}
   ]
 }

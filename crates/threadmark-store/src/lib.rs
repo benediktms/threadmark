@@ -820,7 +820,7 @@ impl Store {
         expected_version: i64,
         mutations: &[BatchMutation],
         now: &str,
-    ) -> Result<i64, StoreError> {
+    ) -> Result<(i64, Vec<Node>, Vec<Claim>), StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let cutoff = reap_expired_claims(&mut tx, effort_id).await?;
         check_version(&mut tx, effort_id, expected_version).await?;
@@ -943,8 +943,12 @@ impl Store {
             }
         }
         let version = bump_version(&mut tx, effort_id, now).await?;
+        let nodes = sqlx::query("SELECT n.*,r.body,r.payload_json FROM nodes n JOIN node_revisions r ON r.node_id=n.id AND r.revision=n.current_revision WHERE n.effort_id=? ORDER BY n.created_at")
+            .bind(effort_id).fetch_all(&mut *tx).await?.into_iter().map(row_to_node).collect::<Result<_,_>>()?;
+        let claims = sqlx::query("SELECT c.* FROM claims c JOIN nodes n ON n.id=c.node_id WHERE n.effort_id=? ORDER BY c.claimed_at")
+            .bind(effort_id).fetch_all(&mut *tx).await?.into_iter().map(row_to_claim).collect();
         tx.commit().await?;
-        Ok(version)
+        Ok((version, nodes, claims))
     }
 
     pub async fn graduate_fog(
@@ -1025,7 +1029,17 @@ impl Store {
         &self,
         effort_id: &str,
         include_events: bool,
-    ) -> Result<(Effort, GraphSnapshot, Vec<Source>, Vec<AuditEvent>), StoreError> {
+        include_revisions: bool,
+    ) -> Result<
+        (
+            Effort,
+            GraphSnapshot,
+            Vec<Source>,
+            Vec<AuditEvent>,
+            Vec<NodeRevision>,
+        ),
+        StoreError,
+    > {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         reap_expired_claims(&mut tx, effort_id).await?;
         let effort = row_to_effort(
@@ -1118,6 +1132,12 @@ impl Store {
             .into_iter()
             .map(row_to_source)
             .collect::<Result<Vec<_>, _>>()?;
+        let revisions = if include_revisions {
+            sqlx::query("SELECT r.* FROM node_revisions r JOIN nodes n ON n.id=r.node_id WHERE n.effort_id=? ORDER BY r.node_id,r.revision")
+                .bind(effort_id).fetch_all(&mut *tx).await?.into_iter().map(row_to_revision).collect::<Result<Vec<_>, _>>()?
+        } else {
+            vec![]
+        };
         tx.commit().await?;
         Ok((
             effort,
@@ -1132,6 +1152,7 @@ impl Store {
             },
             sources,
             events,
+            revisions,
         ))
     }
 
