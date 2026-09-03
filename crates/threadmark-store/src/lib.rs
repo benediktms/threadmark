@@ -779,6 +779,7 @@ impl Store {
     ) -> Result<i64, StoreError> {
         let mut tx = self.pool.begin().await?;
         check_version(&mut tx, effort_id, expected_version).await?;
+        require_source_in_effort(&mut tx, effort_id, source_id).await?;
         sqlx::query("INSERT INTO node_sources(node_id,source_id,relationship) VALUES(?,?,?)")
             .bind(node_id)
             .bind(source_id)
@@ -935,6 +936,7 @@ impl Store {
                     relationship,
                     event,
                 } => {
+                    require_source_in_effort(&mut tx, effort_id, source_id).await?;
                     sqlx::query(
                         "INSERT INTO node_sources(node_id,source_id,relationship) VALUES(?,?,?)",
                     )
@@ -1649,6 +1651,23 @@ async fn check_version(
     Ok(())
 }
 
+async fn require_source_in_effort(
+    tx: &mut Transaction<'_, Sqlite>,
+    effort_id: &str,
+    source_id: &str,
+) -> Result<(), StoreError> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sources WHERE id=? AND effort_id=?)")
+            .bind(source_id)
+            .bind(effort_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if !exists {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
 async fn reject_current_accepted_contradiction(
     tx: &mut Transaction<'_, Sqlite>,
     effort_id: &str,
@@ -2190,6 +2209,63 @@ mod tests {
         );
         assert!(occurred_at.as_str() > "2000-01-01T00:00:00Z");
         assert!(released_at.as_str() > "2000-01-01T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn source_attachments_are_effort_local_without_hiding_existing_links() {
+        let directory = TempDir::new().unwrap();
+        let store = Store::connect(&directory.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces(id,name,root_uri,schema_version,created_at,updated_at) VALUES('workspace','test','test',1,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO efforts(id,workspace_id,slug,title,destination,status,version,created_at,updated_at) VALUES('left','workspace','left','left','left','active',1,'now','now'),('right','workspace','right','right','right','active',1,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO nodes(id,effort_id,kind,title,lifecycle,validity,current_revision,created_at,updated_at) VALUES('node','left','evidence','node','resolved','current',0,'now','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO node_revisions(node_id,revision,body,payload_json,actor_id,created_at) VALUES('node',0,'','{}','test','now')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO sources(id,effort_id,kind,title,metadata_json,trust,created_at) VALUES('source','right','url','source','{}','reviewed','now')")
+            .execute(&store.pool).await.unwrap();
+        let event = AuditEvent {
+            id: "event".into(),
+            effort_id: Some("left".into()),
+            actor_id: "test".into(),
+            session_id: None,
+            event_type: "source_attached".into(),
+            entity_type: "node".into(),
+            entity_id: "node".into(),
+            before: None,
+            after: Some(json!({"source_id":"source","relationship":"supports"})),
+            reason: None,
+            occurred_at: "2026-01-01T00:00:00Z".into(),
+        };
+
+        assert!(matches!(
+            store
+                .attach_source("left", "node", "source", "supports", &event, 1, "now")
+                .await,
+            Err(StoreError::NotFound)
+        ));
+        let mut mutations = [BatchMutation::AttachSource {
+            node_id: "node".into(),
+            source_id: "source".into(),
+            relationship: "supports".into(),
+            event: None,
+        }];
+        assert!(matches!(
+            store.apply_batch("left", 1, &mut mutations).await,
+            Err(StoreError::NotFound)
+        ));
+
+        sqlx::query("INSERT INTO node_sources(node_id,source_id,relationship) VALUES('node','source','supports')")
+            .execute(&store.pool).await.unwrap();
+        let (_, _, sources, _, _, relationships) = store
+            .snapshot_bundle("left", false, Some("node"))
+            .await
+            .unwrap();
+        assert_eq!(sources[0].id, "source");
+        assert_eq!(relationships, [("source".into(), "supports".into())]);
     }
 
     #[tokio::test]

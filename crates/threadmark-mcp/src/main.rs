@@ -1845,26 +1845,31 @@ mod tests {
         )
         .await
         .unwrap();
-        call_tool(
-            &service,
-            "attach_source",
-            &json!({"effort":"batch","node":first,"source":other_source["source"]["id"],"relationship":"context","actor_id":"test","expected_version":7}),
-        )
-        .await
-        .unwrap();
-        let explanation = call_tool(
-            &service,
-            "explain_node",
-            &json!({"effort":"batch","node":first}),
-        )
-        .await
-        .unwrap();
         assert!(
-            explanation["sources"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|attachment| attachment["source"]["title"] == "Other source")
+            call_tool(
+                &service,
+                "attach_source",
+                &json!({"effort":"batch","node":first,"source":other_source["source"]["id"],"relationship":"context","actor_id":"test","expected_version":7}),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            call_tool(
+                &service,
+                "apply_batch",
+                &json!({
+                    "effort":"batch",
+                    "actor_id":"test",
+                    "session_id":"session",
+                    "expected_effort_version":7,
+                    "operations":[
+                        {"op":"attach_source","node":first,"source":other_source["source"]["id"],"relationship":"context"}
+                    ]
+                }),
+            )
+            .await
+            .is_err()
         );
 
         let failed = call_tool(
@@ -1874,7 +1879,7 @@ mod tests {
                 "effort":"batch",
                 "actor_id":"test",
                 "session_id":"session",
-                "expected_effort_version":8,
+                "expected_effort_version":7,
                 "operations":[
                     {"op":"add_node","temp_id":"e3","value":{"kind":"evidence","title":"Third","summary":"","body":"third","payload":{},"lifecycle":"resolved"}},
                     {"op":"add_edge","source":"e1","type":"informs","target":"e2"},
@@ -1885,7 +1890,7 @@ mod tests {
         .await;
         assert!(failed.is_err());
         let (effort, graph) = service.snapshot("batch").await.unwrap();
-        assert_eq!(effort.version, 8);
+        assert_eq!(effort.version, 7);
         assert_eq!(graph.nodes.len(), 3);
         assert_eq!(graph.edges.len(), 2);
     }

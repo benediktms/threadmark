@@ -301,6 +301,9 @@ Source fields:
 - `trust`: `unreviewed | reviewed | authoritative`.
 
 Threadmark records provenance; it does not claim that a source is correct. Trust is assigned explicitly.
+Sources are effort-local: a node may only attach sources owned by the same effort.
+Existing cross-effort links remain readable for backward compatibility, but new
+links are rejected by both dedicated and batch attachment operations.
 
 ### 8.9 Fog patches
 
