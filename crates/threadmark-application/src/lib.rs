@@ -2039,6 +2039,7 @@ fn prepare_adjudication(
         }
         let left = select_node(&graph.nodes, &before.related_nodes[0])?.clone();
         let right = select_node(&graph.nodes, &before.related_nodes[1])?.clone();
+        validate_edge(&left, threadmark_domain::EdgeType::Contradicts, &right)?;
         if graph.edges.iter().any(|edge| {
             edge.edge_type == threadmark_domain::EdgeType::Contradicts
                 && ((edge.source_node_id == left.id && edge.target_node_id == right.id)

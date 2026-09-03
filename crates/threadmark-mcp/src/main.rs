@@ -1574,7 +1574,8 @@ mod tests {
                     {"op":"add_source","temp_id":"s1","kind":"url","title":"Source","uri":"https://example.com","trust":"reviewed"},
                     {"op":"attach_source","node":"e1","source":"s1","relationship":"supports"},
                     {"op":"add_edge","source":"e1","type":"supports","target":"e2"},
-                    {"op":"propose_contradiction","left":"e1","right":"e2","detail":"They disagree"}
+                    {"op":"propose_contradiction","left":"e1","right":"e2","detail":"They disagree"},
+                    {"op":"propose_contradiction","left":"e1","right":"e1","detail":"Invalid self contradiction"}
                 ]
             }),
         )
@@ -1586,6 +1587,7 @@ mod tests {
         let second = result["ids"]["e2"].as_str().unwrap();
         let question = result["ids"]["q1"].as_str().unwrap();
         let finding = result["findings_created"][0].as_str().unwrap();
+        let self_finding = result["findings_created"][1].as_str().unwrap();
 
         let explanation = call_tool(
             &service,
@@ -1598,8 +1600,26 @@ mod tests {
         assert_eq!(explanation["sources"][0]["relationship"], "supports");
         assert_eq!(explanation["sources"][0]["source"]["title"], "Source");
         assert_eq!(explanation["edges"].as_array().unwrap().len(), 1);
-        assert_eq!(explanation["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(explanation["findings"].as_array().unwrap().len(), 2);
         assert_eq!(explanation["revisions"].as_array().unwrap().len(), 1);
+
+        assert!(
+            call_tool(
+                &service,
+                "adjudicate_finding",
+                &json!({
+                    "effort":"batch",
+                    "finding":self_finding,
+                    "outcome":"accepted",
+                    "rationale":"Impossible",
+                    "actor_id":"test",
+                    "session_id":"session",
+                    "expected_version":2
+                }),
+            )
+            .await
+            .is_err()
+        );
 
         let conflicting = call_tool(
             &service,
