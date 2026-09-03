@@ -290,7 +290,7 @@ async fn call_tool(service: &Service, name: &str, args: &Value) -> Result<Value>
         }
         "threadmark_graduate_fog" => {
             let targets = required_strings(args, "to")?;
-            let version = service
+            let (targets, version) = service
                 .graduate_fog(
                     required(args, "effort")?,
                     required(args, "fog")?,
@@ -928,13 +928,14 @@ mod tests {
         )
         .await
         .unwrap();
-        call_tool(
+        let second_selector = second["node"]["id"].as_str().unwrap()[..20].to_owned();
+        let graduated = call_tool(
             &service,
             "threadmark_graduate_fog",
             &json!({
                 "effort": "parity",
                 "fog": fog["fog"]["id"],
-                "to": [second["node"]["id"]],
+                "to": [second_selector],
                 "actor_id": "agent",
                 "expected_version": 4,
             }),
@@ -1006,6 +1007,7 @@ mod tests {
         assert_eq!(effort["status"], "active");
         assert_eq!(snapshot["graph"]["nodes"].as_array().unwrap().len(), 2);
         assert_eq!(snapshot["graph"]["fog_patches"][0]["status"], "graduated");
+        assert_eq!(graduated["graduated_to"], json!([second["node"]["id"]]));
         assert_eq!(snapshot["graph"]["findings"].as_array().unwrap().len(), 1);
         assert_eq!(effort_history["events"].as_array().unwrap().len(), 2);
         assert!(effort_history["next_cursor"].is_string());

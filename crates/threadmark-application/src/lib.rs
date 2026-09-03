@@ -1024,7 +1024,7 @@ impl Service {
         node_selectors: &[String],
         actor_id: &str,
         expected_version: Option<i64>,
-    ) -> Result<i64, ApplicationError> {
+    ) -> Result<(Vec<String>, i64), ApplicationError> {
         let effort = self.active_effort(effort).await?;
         let expected = expected_version.unwrap_or(effort.version);
         let mut node_ids = Vec::with_capacity(node_selectors.len());
@@ -1050,10 +1050,11 @@ impl Service {
             None,
             &timestamp,
         );
-        Ok(self
+        let version = self
             .store
             .graduate_fog(&effort.id, fog_id, &node_ids, &audit, expected, &timestamp)
-            .await?)
+            .await?;
+        Ok((node_ids, version))
     }
 
     #[allow(clippy::too_many_arguments)]

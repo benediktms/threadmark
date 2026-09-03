@@ -1363,7 +1363,9 @@ fn parse_timestamp(value: &str) -> Result<OffsetDateTime, StoreError> {
 fn normalize_timestamp(value: &str) -> Result<String, StoreError> {
     parse_timestamp(value)?
         .to_offset(UtcOffset::UTC)
-        .format(&Rfc3339)
+        .format(time::macros::format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z"
+        ))
         .map_err(|_| StoreError::InvalidTimestamp(value.into()))
 }
 
@@ -1551,9 +1553,8 @@ mod tests {
     #[tokio::test]
     async fn filters_event_times_as_instants_without_losing_precision() {
         let directory = TempDir::new().unwrap();
-        let store = Store::connect(&directory.path().join("state.sqlite3"))
-            .await
-            .unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let store = Store::connect(&path).await.unwrap();
         sqlx::query("INSERT INTO workspaces(id,name,root_uri,schema_version,created_at,updated_at) VALUES('workspace','test','test',1,'now','now')")
             .execute(&store.pool).await.unwrap();
         sqlx::query("INSERT INTO efforts(id,workspace_id,slug,title,destination,status,version,created_at,updated_at) VALUES('effort','workspace','test','test','test','active',1,'now','now')")
@@ -1562,6 +1563,8 @@ mod tests {
             .execute(&store.pool).await.unwrap();
         sqlx::query("INSERT INTO events(id,effort_id,actor_id,event_type,entity_type,entity_id,occurred_at) VALUES('early','effort','test','ordered','node','node','2026-01-01T00:30:00.123Z'),('late','effort','test','ordered','node','node','2026-01-01T00:30:00.123456Z')")
             .execute(&store.pool).await.unwrap();
+        drop(store);
+        let store = Store::connect(&path).await.unwrap();
 
         let events = store
             .list_events(
@@ -1603,6 +1606,36 @@ mod tests {
             events.iter().map(|event| &event.id).collect::<Vec<_>>(),
             ["early", "late"]
         );
+        let filter = EventFilter {
+            event_type: Some("ordered".into()),
+            ..EventFilter::default()
+        };
+
+        let (first, next) = store
+            .list_events_page(
+                "workspace",
+                &filter,
+                Pagination {
+                    limit: 1,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let (second, _) = store
+            .list_events_page(
+                "workspace",
+                &filter,
+                Pagination {
+                    limit: 1,
+                    offset: next.unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first[0].id, "early");
+        assert_eq!(second[0].id, "late");
     }
 
     #[tokio::test]

@@ -763,7 +763,7 @@ async fn dispatch(service: &Service, command: Command, json_output: bool) -> Res
                 actor,
                 expected_version,
             } => {
-                let version = service
+                let (to, version) = service
                     .graduate_fog(&effort, &fog, &to, &actor, expected_version)
                     .await?;
                 output(
