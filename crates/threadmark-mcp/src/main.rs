@@ -621,7 +621,7 @@ fn tool_definitions() -> Vec<Value> {
             "Get one version-bound page of a graph section",
             object(
                 &["effort", "section"],
-                json!({"effort":{"type":"string"},"section":{"type":"string","enum":["nodes","edges","claims","fog_patches","findings","exit_criteria","node_sources","sources"]},"limit":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":"string"}}),
+                json!({"effort":{"type":"string"},"section":{"type":"string","enum":["nodes","edges","claims","fog_patches","findings","exit_criteria","node_sources","sources"]},"snapshot":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":500},"cursor":{"type":"string"}}),
             ),
         ),
         tool(
@@ -1083,6 +1083,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.list_efforts().await.unwrap().len(), 1);
+
+        let nested_root = repository.join("nested-workspace");
+        std::fs::create_dir(&nested_root).unwrap();
+        let nested = Service::init(&nested_root, "nested").await.unwrap();
+        assert_ne!(nested.workspace().id, first.workspace().id);
+        assert!(nested.list_efforts().await.unwrap().is_empty());
     }
 
     #[test]
@@ -1466,6 +1472,11 @@ mod tests {
         ] {
             assert!(tool_definitions().iter().any(|tool| tool["name"] == name));
         }
+        let snapshot_definition = tool_definitions()
+            .into_iter()
+            .find(|tool| tool["name"] == "threadmark_get_snapshot")
+            .unwrap();
+        assert!(snapshot_definition["inputSchema"]["properties"]["snapshot"].is_object());
         for name in [
             "threadmark_add_fog",
             "threadmark_graduate_fog",

@@ -238,12 +238,14 @@ impl Store {
         Ok(row_to_workspace(row))
     }
 
-    pub async fn first_workspace(&self) -> Result<Option<Workspace>, StoreError> {
+    pub async fn list_workspaces(&self) -> Result<Vec<Workspace>, StoreError> {
         Ok(
-            sqlx::query("SELECT * FROM workspaces ORDER BY created_at,id LIMIT 1")
-                .fetch_optional(&self.pool)
+            sqlx::query("SELECT * FROM workspaces ORDER BY created_at,id")
+                .fetch_all(&self.pool)
                 .await?
-                .map(row_to_workspace),
+                .into_iter()
+                .map(row_to_workspace)
+                .collect(),
         )
     }
 

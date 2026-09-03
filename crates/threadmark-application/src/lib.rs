@@ -142,7 +142,12 @@ impl Service {
         }
         fs::create_dir_all(root.join(".threadmark/exports"))?;
         let store = Store::connect(&database_path).await?;
-        let existing = store.first_workspace().await?;
+        let key = workspace_key(&root);
+        let existing = store
+            .list_workspaces()
+            .await?
+            .into_iter()
+            .find(|workspace| workspace_key(Path::new(&workspace.root_uri)) == key);
         let workspace_id = existing
             .as_ref()
             .map_or_else(id, |workspace| workspace.id.clone());
@@ -1418,6 +1423,13 @@ pub fn project_root(start: &Path) -> PathBuf {
         .filter(|output| output.status.success())
         .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
         .unwrap_or_else(|| start.to_path_buf())
+}
+
+fn workspace_key(root: &Path) -> PathBuf {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let project = project_root(&root);
+    let project = project.canonicalize().unwrap_or(project);
+    root.strip_prefix(project).unwrap_or(&root).to_path_buf()
 }
 
 fn database_path(root: &Path) -> PathBuf {
