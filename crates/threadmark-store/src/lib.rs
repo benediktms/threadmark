@@ -836,10 +836,7 @@ impl Store {
         mutations: &mut [BatchMutation],
     ) -> Result<(i64, Vec<Node>, Vec<Claim>, Vec<Node>, Vec<Claim>), StoreError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let now = OffsetDateTime::now_utc()
-            .format(&Rfc3339)
-            .expect("RFC 3339 formatting succeeds");
-        let cutoff = reap_expired_claims(&mut tx, effort_id).await?;
+        let now = reap_expired_claims(&mut tx, effort_id).await?;
         check_version(&mut tx, effort_id, expected_version).await?;
         let before_nodes = sqlx::query("SELECT n.*,r.body,r.payload_json FROM nodes n JOIN node_revisions r ON r.node_id=n.id AND r.revision=n.current_revision WHERE n.effort_id=? ORDER BY n.created_at")
             .bind(effort_id).fetch_all(&mut *tx).await?.into_iter().map(row_to_node).collect::<Result<_,_>>()?;
@@ -880,7 +877,7 @@ impl Store {
                              AND released_at IS NULL AND julianday(lease_expires_at)>julianday(?)",
                         )
                         .bind(&node.id)
-                        .bind(&cutoff)
+                        .bind(&now)
                         .fetch_optional(&mut *tx)
                         .await?;
                         if owner.as_deref() != Some(claimant) {
@@ -1481,7 +1478,7 @@ impl Store {
 }
 
 fn retimestamp_batch_mutation(mutation: &mut BatchMutation, now: &str) {
-    let event = match mutation {
+    match mutation {
         BatchMutation::InsertNode {
             node,
             revision,
@@ -1490,7 +1487,11 @@ fn retimestamp_batch_mutation(mutation: &mut BatchMutation, now: &str) {
             node.created_at = now.into();
             node.updated_at = now.into();
             revision.created_at = now.into();
-            event
+            retimestamp_event(
+                event,
+                now,
+                Some(serde_json::to_value(&*node).expect("node serializes")),
+            );
         }
         BatchMutation::UpdateNode {
             node,
@@ -1505,34 +1506,59 @@ fn retimestamp_batch_mutation(mutation: &mut BatchMutation, now: &str) {
         } => {
             node.updated_at = now.into();
             revision.created_at = now.into();
-            event
+            retimestamp_event(event, now, None);
         }
         BatchMutation::InsertEdge { edge, event } => {
             edge.created_at = now.into();
-            event
+            retimestamp_event(
+                event,
+                now,
+                Some(serde_json::to_value(&*edge).expect("edge serializes")),
+            );
         }
         BatchMutation::InsertSource { source, event } => {
             source.created_at = now.into();
             if source.retrieved_at.is_some() {
                 source.retrieved_at = Some(now.into());
             }
-            event
+            retimestamp_event(
+                event,
+                now,
+                Some(serde_json::to_value(&*source).expect("source serializes")),
+            );
         }
         BatchMutation::UpdateFinding { finding, event } => {
             finding.updated_at = now.into();
-            event
+            retimestamp_event(event, now, None);
+            if let Some(embedded) = event
+                .as_mut()
+                .and_then(|event| event.after.as_mut())
+                .and_then(|after| after.get_mut("finding"))
+            {
+                *embedded = serde_json::to_value(&*finding).expect("finding serializes");
+            }
         }
         BatchMutation::InsertFinding { finding, event } => {
             finding.created_at = now.into();
             finding.updated_at = now.into();
-            event
+            retimestamp_event(
+                event,
+                now,
+                Some(serde_json::to_value(&*finding).expect("finding serializes")),
+            );
         }
         BatchMutation::AttachSource { event, .. } | BatchMutation::GraduateFog { event, .. } => {
-            event
+            retimestamp_event(event, now, None);
         }
-    };
+    }
+}
+
+fn retimestamp_event(event: &mut Option<AuditEvent>, now: &str, after: Option<Value>) {
     if let Some(event) = event {
         event.occurred_at = now.into();
+        if let Some(after) = after {
+            event.after = Some(after);
+        }
     }
 }
 
@@ -1543,6 +1569,7 @@ async fn reap_expired_claims(
     let timestamp: String = sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
         .fetch_one(&mut **tx)
         .await?;
+    let timestamp = normalize_timestamp(&timestamp)?;
     let claims = sqlx::query(
         "SELECT claims.id,claims.node_id FROM claims \
          JOIN nodes ON nodes.id=claims.node_id \
@@ -2079,6 +2106,12 @@ mod tests {
             .execute(&store.pool)
             .await
             .unwrap();
+        sqlx::query("INSERT INTO nodes(id,effort_id,kind,title,lifecycle,validity,current_revision,created_at,updated_at) VALUES('expired-node','effort','action','expired','in_progress','current',0,'1999-01-01T00:00:00Z','1999-01-01T00:00:00Z')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO node_revisions(node_id,revision,body,payload_json,actor_id,created_at) VALUES('expired-node',0,'','{}','test','1999-01-01T00:00:00Z')")
+            .execute(&store.pool).await.unwrap();
+        sqlx::query("INSERT INTO claims(id,node_id,actor_id,claimant,claimed_at,heartbeat_at,lease_expires_at) VALUES('expired-claim','expired-node','test','other','1999-01-01T00:00:00Z','1999-01-01T00:00:00Z','2000-01-01T00:00:00Z')")
+            .execute(&store.pool).await.unwrap();
         sqlx::query("INSERT INTO claims(id,node_id,actor_id,claimant,claimed_at,heartbeat_at,lease_expires_at) VALUES('claim','node','test','test','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z','2999-01-01T00:00:00Z')")
             .execute(&store.pool).await.unwrap();
         let revision = NodeRevision {
@@ -2119,6 +2152,11 @@ mod tests {
                 .fetch_one(&store.pool)
                 .await
                 .unwrap();
+        let after: String =
+            sqlx::query_scalar("SELECT after_json FROM events WHERE id='resolved-event'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&before).unwrap()["lifecycle"],
             "in_progress"
@@ -2133,6 +2171,23 @@ mod tests {
                 .fetch_one(&store.pool)
                 .await
                 .unwrap();
+        let expired_at: String =
+            sqlx::query_scalar("SELECT occurred_at FROM events WHERE entity_id='expired-claim'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        let ordered: Vec<String> = sqlx::query_scalar(
+            "SELECT event_type FROM events WHERE id='resolved-event' OR entity_id='expired-claim' ORDER BY rowid",
+        )
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(expired_at, occurred_at);
+        assert_eq!(ordered, ["claim_expired", "node_resolved"]);
+        assert_eq!(
+            serde_json::from_str::<Value>(&after).unwrap()["updated_at"],
+            occurred_at
+        );
         assert!(occurred_at.as_str() > "2000-01-01T00:00:00Z");
         assert!(released_at.as_str() > "2000-01-01T00:00:00Z");
     }

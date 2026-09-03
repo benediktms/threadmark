@@ -1589,6 +1589,22 @@ mod tests {
         let question = result["ids"]["q1"].as_str().unwrap();
         let finding = result["findings_created"][0].as_str().unwrap();
         let self_finding = result["findings_created"][1].as_str().unwrap();
+        let history = service.effort_history("batch").await.unwrap();
+        for event in history.iter().filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "node_created" | "edge_created" | "source_created" | "finding_proposed"
+            )
+        }) {
+            let after = event.after.as_ref().unwrap();
+            assert_eq!(after["created_at"], event.occurred_at);
+            if event.event_type == "node_created" || event.event_type == "finding_proposed" {
+                assert_eq!(after["updated_at"], event.occurred_at);
+            }
+            if event.event_type == "source_created" {
+                assert_eq!(after["retrieved_at"], event.occurred_at);
+            }
+        }
 
         let explanation = call_tool(
             &service,
@@ -1682,6 +1698,14 @@ mod tests {
             history
                 .iter()
                 .any(|event| { event.event_type == "edge_created" && event.entity_type == "edge" })
+        );
+        let adjudication = history
+            .iter()
+            .find(|event| event.event_type == "finding_adjudicated")
+            .unwrap();
+        assert_eq!(
+            adjudication.after.as_ref().unwrap()["finding"]["updated_at"],
+            adjudication.occurred_at
         );
 
         assert!(
