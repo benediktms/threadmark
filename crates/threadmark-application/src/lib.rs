@@ -119,6 +119,7 @@ struct WorkspaceMarker {
 impl Service {
     pub async fn init(root: &Path, name: &str) -> Result<Self, ApplicationError> {
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        fs::create_dir_all(&root)?;
         let marker_path = root.join(MARKER);
         if marker_path.exists() {
             return Self::open(&root).await;

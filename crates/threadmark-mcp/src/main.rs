@@ -1085,10 +1085,22 @@ mod tests {
         assert_eq!(second.list_efforts().await.unwrap().len(), 1);
 
         let nested_root = repository.join("nested-workspace");
-        std::fs::create_dir(&nested_root).unwrap();
         let nested = Service::init(&nested_root, "nested").await.unwrap();
         assert_ne!(nested.workspace().id, first.workspace().id);
         assert!(nested.list_efforts().await.unwrap().is_empty());
+        nested
+            .create_effort(CreateEffort {
+                slug: "nested".into(),
+                title: "Nested".into(),
+                destination: "Survives restart".into(),
+                scope_notes: String::new(),
+                actor_id: "test".into(),
+            })
+            .await
+            .unwrap();
+        let reopened = Service::open(&nested_root).await.unwrap();
+        assert_eq!(reopened.workspace().id, nested.workspace().id);
+        assert_eq!(reopened.list_efforts().await.unwrap().len(), 1);
     }
 
     #[test]
