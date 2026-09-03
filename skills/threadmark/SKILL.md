@@ -15,11 +15,23 @@ effort fits and the user explicitly authorizes a new effort, create it through
 `create_effort`; never fall back to the CLI. An effort is complete
 only after readiness passes and `complete_effort` succeeds.
 
+For a loose idea with no effort yet, enter **Plan** and settle the destination
+through a live user interview before asking to create the effort. Do not persist
+a knowingly provisional destination.
+
 ## Workflow state machine
 
 Always begin in **Orient**. Load low-resolution context and read the
 destination, scope, readiness failures, frontier, active findings, and active
 fog. Fetch a full node only when it is relevant to the next transition.
+
+An active effort is uncharted only when a version-bound snapshot contains no
+nodes and no fog patches of any status. When frontier and active fog are both
+empty, fetch one `nodes` item, then one `fog_patches` item using the same
+`get_snapshot` token. If both pages are empty, enter **Plan**; do not mistake the
+empty effort's passing readiness for completion. Never infer this state from
+the effort version or an empty frontier. A completed effort requires explicit
+reopening before any new planning.
 
 When the frontier is non-empty, surface its highest-ranked node as a concise
 **next decision** before proposing work: name the question, state the decision
@@ -42,21 +54,30 @@ Orient
 
 ### Plan
 
-Define the destination and exit criteria. Add precise questions, premises, and
-decisions breadth-first; connect dependencies with typed edges. Do not invent
-answers or resolve a decision simply because it was mapped. End in **Stop** and
-ask for approval before entering **Work**.
+Charting a new empty effort is a live human interview in the main user-facing
+thread. Use the host's interview skill when available; otherwise follow this
+protocol directly. After the destination is settled and the effort exists,
+perform a short read-only repository and specification orientation, then map
+the visible space breadth-first rather than pursuing one branch deeply.
 
-Use the frontier to guide the conversation as Wayfinder-style decision prompts:
-ask one question at a time, wait for the answer, then record only the resulting
-fact or decision. After charting, summarize the remaining named questions in
-priority order and stop; the user chooses whether to answer one or authorize
-research.
+Ask one question at a time and wait. When you have a recommendation, state it
+and explain why in one sentence, but never answer for the user. Treat a direct
+answer as confirmation and persist it immediately; ask a follow-up before
+mutation only when the answer is ambiguous, explicitly tentative, or changes
+the question's scope. Record related nodes, edges, sources, resolutions, and fog
+atomically when the MCP supports that combination.
 
-When the boundary of an unknown cannot yet be stated as a useful question,
-record it as a fog patch, with its decision anchor when one is known. Fog is a
-deliberate promise to return, not an unstructured note. A bounded unknown is a
-question, not fog.
+Add precise questions, premises, and decisions as soon as they are nameable;
+connect dependencies with typed edges. Do not invent answers or resolve a
+decision simply because it was mapped. When an unknown cannot yet be stated as
+a useful question, record it as a fog patch with its decision anchor when known.
+Fog is a deliberate promise to return, not an unstructured note. A bounded
+unknown is a question, not fog.
+
+Stop after one breadth-first pass once every visible area is represented by a
+precise node or fog patch, unless the user explicitly asks to chart everything.
+Run lint, display the initial frontier and remaining fog, summarize the named
+questions in priority order, and ask for explicit approval before **Work**.
 
 ### Work
 
@@ -94,6 +115,10 @@ If work uncovers an unknown, classify it before continuing:
 Active fog blocks readiness. Re-enter the anchored area, turn a fog patch into
 one or more precise nodes, connect their dependencies, and graduate the patch
 to those nodes. Then return to **Work** or **Verify**.
+
+Use a live interview for fog about intent, priorities, or judgment. For factual
+or codebase fog, state the proposed read-only investigation and wait for the
+user's explicit approval before researching it.
 
 Do not silently represent a fog patch with an unrelated node. If the current
 MCP does not expose the required fog create or graduate transition, record that
